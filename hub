@@ -1117,7 +1117,7 @@ Player.Character.HumanoidRootPart.CFrame = Workspace.Interiors:FindFirstChildWhi
 Player.Character.HumanoidRootPart.CFrame = CFrame.new(-247.35408, 17.3820152, -1518.88879)  Workspace.Gravity = 196.2 
 end)
 
-local Toggle1 = Section2:CreateToggle("Activar Velocidad de Paseo/Fuerza de Salto", Settings.Go, function(State)
+local Toggle1 = Section2:CreateToggle("Activar Velocidad y Fuerza de Salto", Settings.Go, function(State)
 Settings.Go = State
 RunService.Stepped:connect(
     function()
