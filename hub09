@@ -88,7 +88,7 @@ StarterGui:SetCore(
     "SendNotification",
     {
         Title = "Warning",
-        Text = "HWID Incorrecto, Iniciando Shell"
+        Text = "HWID Incorrecto, Iniciando Shell +"
     }
 )
 
