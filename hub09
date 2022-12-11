@@ -312,7 +312,7 @@ local Pet
 local PetsShow = {}
 local List = {}
 for i, v in pairs(require(ReplicatedStorage.ClientModules.Core.ClientData).get_data()[Player.Name].inventory.pets) do
-    local Key = tostring(v["id"]) .. " - " .. tostring(v["properties"]["age"]) .. " years old"
+    local Key = tostring(v["id"]) .. " - " .. tostring(v["properties"]["age"]) .. " año/s"
     PetsShow[Key] = v
     table.insert(List, Key)
     table.sort(List, key)
