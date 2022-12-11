@@ -10,7 +10,7 @@ getgenv().Get =
 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/LukistasWTF/Hub/main/Universal_Client_Bypass"))()
 local Config = {
-    WindowName = "Michery Hub | by Mιƈԋҽɾყ#8627",
+    WindowName = "Michery Hub | Licensed by 0Systems",
     Color = Color3.fromRGB(7, 152, 164),
     Keybind = Enum.KeyCode.RightControl
 }
@@ -1079,6 +1079,17 @@ while true do
 local args = {
     [1] = "pets",
     [2] = "winter_2022_ice_moth_dragon",
+    [3] = {}
+}
+
+game:GetService("ReplicatedStorage").API:FindFirstChild("ShopAPI/BuyItem"):InvokeServer(unpack(args))
+end
+end)
+local Toggle2 = Section2:CreateToggle("Caja de Poni", Settings.Legendaria, function(State)
+while true do
+local args = {
+    [1] = "gifts",
+    [2] = "winter_2022_pony_box",
     [3] = {}
 }
 
