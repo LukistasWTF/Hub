@@ -1,0 +1,53 @@
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/xHeptc/Kavo-UI-Library/main/source.lua"))()
+local Window = Library.CreateLib("NFR Hub | Adopt Me | 1_F0", "Serpent")
+
+-- MAIN
+local Main = Window:NewTab("Main")
+local MainSection = Main:NewSection("Main Features")
+
+MainSection:NewButton("Make All Pets Neon Flying Rideable", "OP STUFF!!", function()
+    local clientData = require(game.ReplicatedStorage.ClientModules.Core.ClientData)
+    local playerData = clientData.get_data()[tostring(game.Players.LocalPlayer)]
+    for i,v in pairs(playerData.inventory.pets) do
+        v.properties.rideable = true
+        v.properties.flyable = true
+        v.properties.mega_neon = true
+    end
+end)
+
+MainSection:NewButton("Comprar Huevo", "Compra el huevo mythic_egg", function()
+    local EggToBuy = "mythic_egg"
+    local args = {"pets", EggToBuy, {}}
+    game:GetService("ReplicatedStorage").API["ShopAPI/BuyItem"]:InvokeServer(unpack(args))
+end)
+
+local FunSection = Main:NewSection("Troll Stuff")
+
+FunSection:NewButton("Backflip Script", "hoppy hoppy", function()
+    loadstring(game:HttpGet('https://pastebin.com/raw/7wDcPtLk'))()
+end)
+
+FunSection:NewButton("Infinite Yield", "FE Admin Commands", function()
+    loadstring(game:HttpGet(('https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source'),true))()
+end)
+
+-- LOCAL PLAYER
+local Player = Window:NewTab("Player")
+local PlayerSection = Player:NewSection("Player | Keep Moving While Changing These")
+
+PlayerSection:NewSlider("Walkspeed", "SPEED!!", 500, 16, function(s)
+    game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = s
+end)
+
+PlayerSection:NewSlider("Jumppower", "JUMP HIGH!!", 350, 50, function(s)
+    game.Players.LocalPlayer.Character.Humanoid.JumpPower = s
+end)
+
+PlayerSection:NewButton("Reset WS/JP", "Resets to all defaults", function()
+    game.Players.LocalPlayer.Character.Humanoid.JumpPower = 50
+    game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = 16
+end)
+
+-- Credits
+local Credits = Window:NewTab("Credits")
+local CreditsSection = Credits:NewSection("Credits: 1_F0")
