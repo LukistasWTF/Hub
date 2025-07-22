@@ -1,0 +1,554 @@
+--====================================================================--
+--  Bucks Transfer + Intercept + Anti‑AFK ▌ STABLE v14 (single‑col)
+--    • Scroll arreglado  • Botón ☰ mostrar/ocultar  • Espaciado uniforme
+--====================================================================--
+
+------------------------------  CONSTANTES (SEMILLA – se pueden cambiar en la UI)
+local CHUNK_SIZE  = 149
+local MAX_OP      = 50
+local DEF_FIRST_SUB_INTERVAL = 10
+local DEF_SUB_INTERVAL       = 15
+local DEF_COOLDOWN_SEC       = 95
+-----------------------------------------------------------------------
+
+------------------------------  SERVICIOS / MÓDULOS
+local RS           = game:GetService("ReplicatedStorage")
+local Players      = game:GetService("Players")
+local LP           = Players.LocalPlayer
+local VU           = game:GetService("VirtualUser")      -- Anti‑AFK
+local Fsys         = require(RS:WaitForChild("Fsys"))
+local Roact        = Fsys.load("Roact")
+local RouterClient = Fsys.load("RouterClient")
+
+------------------------------  INTERCEPT EVENT
+local interceptEv = RS:FindFirstChild("BucksInterceptEvent") or Instance.new("BindableEvent", RS)
+interceptEv.Name = "BucksInterceptEvent"
+
+------------------------------  RUTAS A ESPIAR
+local WATCH = {
+    ["HousingAPI/ActivateFurniture"]         = true,
+    ["HousingAPI/ActivateInteriorFurniture"] = true,
+}
+local pathByInstance = {}
+do
+    local _get = RouterClient.get
+    RouterClient.get = function(route, ...)
+        local inst = _get(route, ...)
+        if WATCH[route] then pathByInstance[inst] = route end
+        return inst
+    end
+    for route in pairs(WATCH) do
+        pathByInstance[_get(route)] = route
+    end
+end
+
+------------------------------  HELPERS
+local function getPos(io)
+    local p = io.Position
+    if typeof(p) == "Vector3" then return Vector2.new(p.X, p.Y)
+    elseif typeof(p) == "Vector2" then return p
+    else return Vector2.zero end
+end
+
+local function formatTime(sec)
+    if sec <= 0 then return "0s" end
+    local h = math.floor(sec/3600)
+    local m = math.floor((sec%3600)/60)
+    local s = sec%60
+    local t = {}
+    if h>0 then table.insert(t,h.."h") end
+    if m>0 then table.insert(t,m.."m") end
+    if s>0 or #t==0 then table.insert(t,s.."s") end
+    return table.concat(t," ")
+end
+
+local function safeNumber(txt,def)
+    local n = tonumber(txt)
+    return (n and n>=0) and n or def
+end
+
+local function calcEta(amount, FIRST_SUB_INTERVAL, SUB_INTERVAL, COOLDOWN_SEC)
+    local amt = tonumber(amount)
+    if not amt or amt<=0 then return 0 end
+    local cycles = math.ceil(amt / CHUNK_SIZE)
+    local eta = 0
+    for i=1,cycles do
+        local cs  = (i<cycles) and CHUNK_SIZE or (amt - CHUNK_SIZE*(cycles-1))
+        local ops = math.ceil(cs / MAX_OP)
+        eta += (ops-1) * ((i==1) and FIRST_SUB_INTERVAL or SUB_INTERVAL)
+        if i<cycles then eta += COOLDOWN_SEC end
+    end
+    return eta
+end
+
+------------------------------  HOOK __namecall (igual que siempre)
+if not rawget(_G,"__BUCKS_HOOK") then
+    local mt = getrawmetatable(game); setreadonly(mt,false)
+    local oldNamecall = mt.__namecall
+    mt.__namecall = function(self,...)
+        local method = getnamecallmethod()
+        local route  = pathByInstance[self]
+        if route and (method=="InvokeServer" or (method=="FireServer" and self:IsA("RemoteEvent"))) then
+            local args={...}
+            if #args>0 and (typeof(args[1])~="table" or next(args[1])) then
+                interceptEv:Fire(route,args)
+            end
+        end
+        return oldNamecall(self,...)
+    end
+    setreadonly(mt,true)
+    _G.__BUCKS_HOOK=true
+end
+
+------------------------------  COMPONENTE UI
+local App = Roact.Component:extend("BucksApp")
+
+function App:init()
+    self.state = {
+        amount="0", sending=false, progress=0, timeRemaining=0,
+        status="", cancelRequested=false, pending=0,
+
+        interceptOn=false, antiAFKOn=false, showUI=true,
+
+        data={player="-",unique="-",block="-",remote="-"},
+        estInput="", estEta=0,
+
+        first=DEF_FIRST_SUB_INTERVAL, sub=DEF_SUB_INTERVAL, cooldown=DEF_COOLDOWN_SEC,
+
+        dragging=false, dragOffset=Vector2.zero,
+        pos=UDim2.new(0.5,-309,0.5,-184), -- ventana 618×367
+
+    }
+    -- listener intercept
+    self.ev = interceptEv.Event:Connect(function(route,args)
+        if not self.state.interceptOn then return end
+        local d={remote=route,player="-",unique="-",block="-"}
+        if typeof(args[1])=="Instance" and args[1]:IsA("Player") then
+            d.player=args[1].Name; d.unique=tostring(args[2]); d.block=tostring(args[3])
+        else
+            d.unique=tostring(args[1]); d.block=tostring(args[2])
+        end
+        self:setState({data=d})
+    end)
+end
+
+function App:willUnmount()
+    if self.ev then self.ev:Disconnect() end
+    if self.afkConn then self.afkConn:Disconnect() end
+end
+
+------------------------------  DRAG
+function App:startDrag(io)
+    self:setState({dragging=true, dragOffset=getPos(io)-self.ref.AbsolutePosition})
+end
+function App:doDrag(io)
+    if self.state.dragging then
+        local np = getPos(io)-self.state.dragOffset
+        self:setState({pos=UDim2.new(0,np.X,0,np.Y)})
+    end
+end
+function App:stopDrag() self:setState({dragging=false}) end
+
+------------------------------  TOGGLES
+function App:toggleAntiAFK()
+    if not self.state.antiAFKOn then
+        self.afkConn = Players.LocalPlayer.Idled:Connect(function()
+            VU:CaptureController(); VU:ClickButton2(Vector2.zero)
+        end)
+    elseif self.afkConn then
+        self.afkConn:Disconnect(); self.afkConn=nil
+    end
+    self:setState({antiAFKOn=not self.state.antiAFKOn})
+end
+function App:toggleUI()
+    self:setState({showUI=not self.state.showUI})
+end
+
+------------------------------  ESTIMATOR / RESET
+function App:updateEstimator(text)
+    self:setState({estInput=text, estEta=calcEta(text,self.state.first,self.state.sub,self.state.cooldown)})
+end
+function App:resetConstants()
+    self:setState({first=DEF_FIRST_SUB_INTERVAL, sub=DEF_SUB_INTERVAL, cooldown=DEF_COOLDOWN_SEC})
+end
+
+function App:transfer()
+    --------------------------------------------------  BLOQUE DE GUARDAS
+    if self.state.sending then return end
+
+    local total = tonumber(self.state.amount)
+    if not total or total <= 0 then
+        self:setState{status = "❌ Invalid amount."}
+        return
+    end
+
+    local d = self.state.data
+    if d.unique == "-" or d.block == "-" then
+        self:setState{status = "❌ Intercept first."}
+        return
+    end
+
+    -- ¿está conectado el destinatario?
+    if d.player ~= "-" and not Players:FindFirstChild(d.player) then
+        self:setState{status = "❌ The user is not connected."}
+        return
+    end
+
+    --------------------------------------------------  CONGELAR VARIABLES
+    local FIRST_SUB_INTERVAL = self.state.first        -- UI “FIRST_SUB_INTERVAL”
+    local SUB_INTERVAL       = self.state.sub          -- UI “SUB_INTERVAL”
+    local COOLDOWN_SEC       = self.state.cooldown     -- UI “COOLDOWN_SEC”
+
+    --------------------------------------------------  PREPARAR CICLOS
+    local nCycles     = math.ceil(total / CHUNK_SIZE)
+    local cycleSizes  = {}
+    for i = 1, nCycles do
+        if i < nCycles then
+            cycleSizes[i] = CHUNK_SIZE
+        else
+            cycleSizes[i] = total - CHUNK_SIZE * (nCycles - 1)
+        end
+    end
+
+    local eta = calcEta(total, FIRST_SUB_INTERVAL, SUB_INTERVAL, COOLDOWN_SEC)
+
+    --------------------------------------------------  INICIAR ESTADO “sending”
+    self:setState{
+        sending         = true,
+        cancelRequested = false,
+        status          = "⚙️ Sending…",
+        progress        = 0,
+        timeRemaining   = eta,
+        pending         = total,
+    }
+
+    --------------------------------------------------  CORRUTINA PRINCIPAL
+    task.spawn(function()
+        local sentTotal = 0
+        local leaveConn
+
+        --  cancelar si el destinatario abandona
+        if d.player ~= "-" then
+            leaveConn = Players.PlayerRemoving:Connect(function(plr)
+                if plr.Name == d.player then
+                    self:setState{cancelRequested = true}
+                end
+            end)
+        end
+
+        local function cleanup()
+            if leaveConn then leaveConn:Disconnect() end
+        end
+
+        --------------------------------------------------  BUCLE DE CICLOS
+        for ci, cs in ipairs(cycleSizes) do
+            local ops = math.ceil(cs / MAX_OP)
+            for oi = 1, ops do
+                if self.state.cancelRequested then
+                    cleanup()
+                    self:setState{
+                        sending       = false,
+                        status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                        timeRemaining = 0,
+                        pending       = total - sentTotal,
+                    }
+                    return
+                end
+
+                ------------------------------------------  ENVIAR LOTE
+                local qty   = (oi < ops) and MAX_OP or (cs - MAX_OP * (ops - 1))
+                local route = (d.player ~= "-") and "HousingAPI/ActivateFurniture"
+                                             or "HousingAPI/ActivateInteriorFurniture"
+                local args  = (d.player ~= "-")
+                                and {Players[d.player], d.unique, d.block, qty, LP.Character}
+                                or  {d.unique, d.block, qty, LP.Character}
+                local remote = RouterClient.get(route)
+
+                local ok, err = pcall(function()
+                    remote.InvokeServer(remote, table.unpack(args))
+                end)
+                if not ok then
+                    cleanup()
+                    self:setState{
+                        sending       = false,
+                        status        = ("❌ Operation %d.%d failed: %s"):format(ci, oi, err),
+                        timeRemaining = 0,
+                        pending       = total - sentTotal,
+                    }
+                    return
+                end
+
+                sentTotal += qty
+                self:setState{
+                    progress = sentTotal / total,
+                    status   = ("✅ %d/%d sent"):format(sentTotal, total),
+                    pending  = total - sentTotal,
+                }
+
+                ------------------------------------------  ESPERA ENTRE OPERACIONES
+                if oi < ops then
+                    local waitTime = (ci == 1) and FIRST_SUB_INTERVAL or SUB_INTERVAL
+                    for _ = 1, waitTime do
+                        task.wait(1)
+                        if self.state.cancelRequested then
+                            cleanup()
+                            self:setState{
+                                sending       = false,
+                                status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                                timeRemaining = 0,
+                                pending       = total - sentTotal,
+                            }
+                            return
+                        end
+                        self:setState{timeRemaining = self.state.timeRemaining - 1}
+                    end
+                end
+            end
+
+            ----------------------------------------------  COOLDOWN ENTRE CICLOS
+            if ci < nCycles then
+                for _ = 1, COOLDOWN_SEC do
+                    task.wait(1)
+                    if self.state.cancelRequested then
+                        cleanup()
+                        self:setState{
+                            sending       = false,
+                            status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                            timeRemaining = 0,
+                            pending       = total - sentTotal,
+                        }
+                        return
+                    end
+                    self:setState{timeRemaining = self.state.timeRemaining - 1}
+                end
+            end
+        end
+
+        --------------------------------------------------  FIN
+        cleanup()
+        self:setState{
+            sending       = false,
+            progress      = 1,
+            status        = "🎉 Done!",
+            timeRemaining = 0,
+            pending       = 0,
+        }
+    end)
+end
+
+-----------------------------------------------------------------------
+function App:render()
+    local s,d=self.state,self.state.data
+    local pct=s.progress
+    local showPend = s.sending and s.pending>0
+    local fade = s.interceptOn and 0 or 0.4
+
+    ------------------------------------------------------------  BOTÓN FLOTANTE ☰
+    local ToggleButton = Roact.createElement("TextButton",{
+        Text="☰",Font=Enum.Font.GothamBold,TextSize=22,
+        BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),
+        Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,10),ZIndex=5,
+        [Roact.Event.Activated]=function() self:toggleUI() end,
+    })
+
+    ------------------------------------------------------------  CONTENIDO UI
+    local MainFrame = Roact.createElement("Frame",{
+        Visible=s.showUI,
+        Size=UDim2.new(0,618,0,367),
+        Position=s.pos,
+        BackgroundColor3=Color3.fromRGB(30,30,30),BorderSizePixel=0,
+        [Roact.Ref]=function(r)self.ref=r end,
+        [Roact.Event.InputBegan]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseButton1 then self:startDrag(io)end end,
+        [Roact.Event.InputChanged]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseMovement then self:doDrag(io)end end,
+        [Roact.Event.InputEnded]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseButton1 then self:stopDrag()end end,
+    },{
+
+        UICorner = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+        -- Contenedor scroll
+        Scroll = Roact.createElement("ScrollingFrame",{
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            CanvasSize = UDim2.new(0,0,0,0),
+            ScrollBarThickness = 6,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1,0,1,0),
+        },{
+
+            -- Wrapper de 390 px centrado
+            Wrapper = Roact.createElement("Frame",{
+                BackgroundTransparency = 1,
+                Size = UDim2.new(0,390,0,0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                AnchorPoint = Vector2.new(0.5,0),
+                Position = UDim2.new(0.5,0,0,0),
+            },{
+
+                UILayout = Roact.createElement("UIListLayout",{
+                    Padding = UDim.new(0,8),
+                    SortOrder = Enum.SortOrder.LayoutOrder,
+                }),
+                UIPad = Roact.createElement("UIPadding",{PaddingLeft=UDim.new(0,0),PaddingRight=UDim.new(0,0),PaddingTop=UDim.new(0,10)}),
+
+                -- 1) Título
+                Title = Roact.createElement("TextLabel",{
+                    LayoutOrder=0,
+                    Text="Bucks Transfer",Font=Enum.Font.GothamBold,TextSize=22,
+                    BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+                    Size=UDim2.new(1,0,0,28),
+                }),
+
+                -- 2) Monto + Send
+                Row1 = Roact.createElement("Frame",{
+                    LayoutOrder=1,
+                    BackgroundTransparency=1,Size=UDim2.new(1,0,0,34),
+                },{
+                    Amount = Roact.createElement("TextBox",{
+                        Text=s.amount,PlaceholderText="Amount",Font=Enum.Font.Gotham,TextSize=18,
+                        BackgroundColor3=Color3.fromRGB(55,55,55),TextColor3=Color3.new(1,1,1),
+                        ClearTextOnFocus=false,Size=UDim2.new(0.65,-4,1,0),
+                        [Roact.Change.Text]=function(t)self:setState({amount=t.Text})end,
+                    }),
+                    Send = Roact.createElement("TextButton",{
+                        Text=s.sending and formatTime(s.timeRemaining) or "Send",
+                        Font=Enum.Font.GothamBold,TextSize=18,
+                        BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),
+                        Size=UDim2.new(0.35,-4,1,0),Position=UDim2.new(0.65,4,0,0),
+                        [Roact.Event.Activated]=function() self:transfer() end,
+                    }),
+                }),
+
+                -- 3) Progress + ETA
+                ProgBG = Roact.createElement("Frame",{
+                    LayoutOrder=2,
+                    Size=UDim2.new(1,0,0,14),BackgroundColor3=Color3.fromRGB(50,50,50),BorderSizePixel=0,
+                },{
+                    UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}),
+                    Fill=Roact.createElement("Frame",{
+                        Size=UDim2.new(pct,0,1,0),BackgroundColor3=Color3.fromRGB(80,200,100),BorderSizePixel=0,
+                    },{
+                        UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})
+                    }),
+                }),
+                ETA = Roact.createElement("TextLabel",{
+                    LayoutOrder=3,
+                    Text="ETA: "..formatTime(s.timeRemaining),Font=Enum.Font.Gotham,TextSize=15,
+                    BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),
+                    Size=UDim2.new(1,0,0,16),
+                }),
+
+                StopBtn = Roact.createElement("TextButton",{
+                    LayoutOrder=4,Visible=s.sending,
+                    Text="Stop transaction",Font=Enum.Font.GothamBold,TextSize=18,
+                    BackgroundColor3=Color3.fromRGB(180,60,60),TextColor3=Color3.new(1,1,1),
+                    BorderSizePixel=0,Size=UDim2.new(1,0,0,32),
+                    [Roact.Event.Activated]=function() self:setState({cancelRequested=true}) end,
+                }),
+
+                Status = Roact.createElement("TextLabel",{
+                    LayoutOrder=5,
+                    Text=s.status,Font=Enum.Font.Gotham,TextSize=15,
+                    BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+                    Size=UDim2.new(1,0,0,18),
+                }),
+                Pending = Roact.createElement("TextLabel",{
+                    LayoutOrder=6,Visible=showPend,
+                    Text="Quantity pending: "..s.pending,Font=Enum.Font.Gotham,TextSize=15,
+                    BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),
+                    TextXAlignment=Enum.TextXAlignment.Right,Size=UDim2.new(1,0,0,16),
+                }),
+
+                -- 4) Botones ON/OFF
+                InterBtn = Roact.createElement("TextButton",{
+                    LayoutOrder=7,
+                    Text=s.interceptOn and "🟢 Intercept ON" or "⚪ Intercept",
+                    Font=Enum.Font.GothamBold,TextSize=18,
+                    BackgroundColor3=s.interceptOn and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),
+                    TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(1,0,0,30),
+                    [Roact.Event.Activated]=function() self:setState({interceptOn=not s.interceptOn}) end,
+                }),
+                AFKBtn = Roact.createElement("TextButton",{
+                    LayoutOrder=8,
+                    Text=s.antiAFKOn and "🟢 Anti‑AFK ON" or "⚪ Anti‑AFK",
+                    Font=Enum.Font.GothamBold,TextSize=18,
+                    BackgroundColor3=s.antiAFKOn and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),
+                    TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(1,0,0,30),
+                    [Roact.Event.Activated]=function() self:toggleAntiAFK() end,
+                }),
+
+                -- 5) Data card
+                s.interceptOn and Roact.createElement("Frame",{
+                    LayoutOrder=9,BackgroundColor3=Color3.fromRGB(45,45,45),BackgroundTransparency=fade,
+                    Size=UDim2.new(1,0,0,100),
+                },{
+                    UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+                    Padding=Roact.createElement("UIPadding",{PaddingTop=UDim.new(0,6),PaddingLeft=UDim.new(0,8)}),
+                    List=Roact.createElement("UIListLayout",{Padding=UDim.new(0,4),SortOrder=Enum.SortOrder.LayoutOrder}),
+                    H=Roact.createElement("TextLabel",{LayoutOrder=0,Text=("Intercepted Data [%s]"):format(d.remote),Font=Enum.Font.GothamBold,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,-16,0,18)}),
+                    P=Roact.createElement("TextLabel",{LayoutOrder=1,Text="Player : "..d.player,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+                    U=Roact.createElement("TextLabel",{LayoutOrder=2,Text="Unique : "..d.unique,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+                    B=Roact.createElement("TextLabel",{LayoutOrder=3,Text="Block  : "..d.block,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+                }),
+
+                -- 6) Variables  ............................................
+                VarTitle = Roact.createElement("TextLabel",{LayoutOrder=10,Text="Variables",Font=Enum.Font.GothamBold,TextSize=18,
+                    BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,22)}),
+
+                VarFrame = Roact.createElement("Frame",{LayoutOrder=11,BackgroundTransparency=1,Size=UDim2.new(1,0,0,112)},{
+                    List  = Roact.createElement("UIListLayout",{Padding=UDim.new(0,4)}),
+
+                    L1 = Roact.createElement("TextLabel",{Text="FIRST_SUB_INTERVAL",Font=Enum.Font.Gotham,TextSize=15,
+                        BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+                    T1 = Roact.createElement("TextBox",{Text=tostring(s.first),Font=Enum.Font.Gotham,TextSize=16,
+                        BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                        Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                        [Roact.Change.Text]=function(t) self:setState({first=safeNumber(t.Text,s.first)}) end}),
+
+                    L2 = Roact.createElement("TextLabel",{Text="SUB_INTERVAL",Font=Enum.Font.Gotham,TextSize=15,
+                        BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+                    T2 = Roact.createElement("TextBox",{Text=tostring(s.sub),Font=Enum.Font.Gotham,TextSize=16,
+                        BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                        Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                        [Roact.Change.Text]=function(t) self:setState({sub=safeNumber(t.Text,s.sub)}) end}),
+
+                    L3 = Roact.createElement("TextLabel",{Text="COOLDOWN_SEC",Font=Enum.Font.Gotham,TextSize=15,
+                        BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+                    T3 = Roact.createElement("TextBox",{Text=tostring(s.cooldown),Font=Enum.Font.Gotham,TextSize=16,
+                        BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                        Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                        [Roact.Change.Text]=function(t) self:setState({cooldown=safeNumber(t.Text,s.cooldown)}) end}),
+                }),
+
+                -- 🚩 Separador para alejar el botón ↓↓↓
+                SpacerAfterVars = Roact.createElement("Frame",{LayoutOrder=12,BackgroundTransparency=1,
+                    Size=UDim2.new(1,0,0,8)}),
+
+                -- Botón grande “Reset constants” ...........................
+                ResetBtn = Roact.createElement("TextButton",{LayoutOrder=13,
+                    Text="Reset constants",Font=Enum.Font.GothamBold,TextSize=18,
+                    BackgroundColor3=Color3.fromRGB(70,70,150),TextColor3=Color3.new(1,1,1),
+                    BorderSizePixel=0,Size=UDim2.new(1,0,0,34),
+                    [Roact.Event.Activated]=function() self:resetConstants() end}),
+
+                -- 7) Estimador
+                EstLbl = Roact.createElement("TextLabel",{LayoutOrder=13,Text="How long would it take?",Font=Enum.Font.GothamBold,TextSize=18,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,22)}),
+                EstFrame = Roact.createElement("Frame",{LayoutOrder=14,BackgroundColor3=Color3.fromRGB(45,45,45),Size=UDim2.new(1,0,0,46),BorderSizePixel=0},{
+                    UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+                    EstInput=Roact.createElement("TextBox",{Text=s.estInput,PlaceholderText="Amount",Font=Enum.Font.Gotham,TextSize=17,BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),ClearTextOnFocus=false,Size=UDim2.new(0.55,-4,0,30),Position=UDim2.new(0,8,0,8),[Roact.Change.Text]=function(t)self:updateEstimator(t.Text) end}),
+                    EstBtn=Roact.createElement("TextButton",{Text="Estimate",Font=Enum.Font.GothamBold,TextSize=17,BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.35,-4,0,30),Position=UDim2.new(0.62,4,0,8),[Roact.Event.Activated]=function() self:updateEstimator(s.estInput) end}),
+                }),
+                EstRes = Roact.createElement("TextLabel",{LayoutOrder=15,Text=(s.estEta>0)and("You would need to wait "..formatTime(s.estEta))or"",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,18)}),
+
+                -- 8) Footer
+                Footer = Roact.createElement("TextLabel",{LayoutOrder=16,Text="Created by 0Systems - hehehe",Font=Enum.Font.Gotham,TextSize=13,BackgroundTransparency=1,TextColor3=Color3.fromRGB(150,150,150),TextXAlignment=Enum.TextXAlignment.Center,Size=UDim2.new(1,0,0,18)}),
+            }),
+        }),
+    })
+
+    return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+        Toggle = ToggleButton,
+        Main   = MainFrame,
+    })
+end
+
+Roact.mount(Roact.createElement(App), LP:WaitForChild("PlayerGui"))
