@@ -6,8 +6,8 @@
 ------------------------------  CONSTANTES (SEMILLA – se pueden cambiar en la UI)
 local CHUNK_SIZE  = 149
 local MAX_OP      = 50
-local DEF_FIRST_SUB_INTERVAL = 10
-local DEF_SUB_INTERVAL       = 15
+local DEF_FIRST_SUB_INTERVAL = 9
+local DEF_SUB_INTERVAL       = 9
 local DEF_COOLDOWN_SEC       = 95
 -----------------------------------------------------------------------
 
