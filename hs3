@@ -1,0 +1,95 @@
+-- LocalScript
+
+local load = require(game.ReplicatedStorage.Fsys).load
+local ClientData = load("ClientData")
+
+-- Convierte Color3 -> texto #RRGGBB
+local function colorToHex(c: Color3)
+	return string.format("#%02X%02X%02X", math.floor(c.R*255), math.floor(c.G*255), math.floor(c.B*255))
+end
+
+-- Envía mensaje de sistema al chat
+local function systemMessage(text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
+			Text = text,
+			Color = Color3.new(1,1,0),
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 18,
+		})
+	end)
+	print(text)
+end
+
+-- Busca el modelo del interior (el que tiene carpetas Walls/Doors/Floors)
+local function findInteriorModel()
+	local root = workspace:FindFirstChild("HouseInteriors")
+	if not root then return nil end
+	for _, inst in ipairs(root:GetDescendants()) do
+		if inst:IsA("Model") and inst:FindFirstChild("Walls") and inst:FindFirstChild("Doors") then
+			return inst
+		end
+	end
+end
+
+-- Recolecta partes de una carpeta
+local function collectParts(folder: Instance)
+	local list = {}
+	if not folder then return list end
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(list, {name = d:GetFullName(), color = colorToHex(d.Color)})
+		end
+	end
+	return list
+end
+
+local function reportHouse()
+	local hi = ClientData.get("house_interior")
+	if not hi or not hi.player then
+		return
+	end
+
+	local interior = findInteriorModel()
+	if not interior then
+		systemMessage("[CASA] Interior todavía no montado.")
+		return
+	end
+
+	local owner = hi.player
+
+	-- Carpeta de muebles: a veces puede existir “Furniture” dentro del interior;
+	-- si no existe, intentamos encontrar cualquier carpeta llamada "Furniture" colgando del interior.
+	local furnitureFolder = interior:FindFirstChild("Furniture") or interior:FindFirstChildWhichIsA("Folder")
+
+	local walls = collectParts(interior:FindFirstChild("Walls"))
+	local doors = collectParts(interior:FindFirstChild("Doors"))
+	local furniture = collectParts(furnitureFolder)
+
+	systemMessage(string.format("[CASA] Propietario: %s", owner.Name))
+
+	local function dump(title, list)
+		if #list == 0 then
+			systemMessage(title..": (vacío)")
+			return
+		end
+		systemMessage(title..":")
+		for _, info in ipairs(list) do
+			systemMessage((" - %s (%s)"):format(info.name, info.color))
+			task.wait() -- para no spamear de golpe
+		end
+	end
+
+	dump("Muebles", furniture)
+	dump("Paredes", walls)
+	dump("Puertas", doors)
+end
+
+-- Callback cuando cambia house_interior
+ClientData.register_callback("house_interior", function(_, _, _)
+	-- Pequeño retraso para que Roact monte el modelo
+	task.delay(1, reportHouse)
+end)
+
+-- Si ya estás dentro al cargar el script
+task.delay(2, reportHouse)
