@@ -1,0 +1,271 @@
+-- LocalScript: listar info completa de la casa (con texturas mejoradas)
+-- Colocar en StarterPlayerScripts
+
+local load = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+local ClientData = load("ClientData")
+local STARTER_GUI = game:GetService("StarterGui")
+
+---------------------------------------------------------------------
+-- Utilidades
+---------------------------------------------------------------------
+local function colorToHex(c: Color3?)
+	if not c then return "N/A" end
+	return string.format("#%02X%02X%02X", math.floor(c.R*255), math.floor(c.G*255), math.floor(c.B*255))
+end
+
+local function vecToStr(v: Vector3?)
+	if not v then return "(sin posición)" end
+	return string.format("(%.2f, %.2f, %.2f)", v.X, v.Y, v.Z)
+end
+
+local function cfToAngles(cf: CFrame?)
+	if not cf then return "(rot 0,0,0)" end
+	local rx, ry, rz = cf:ToOrientation() -- radianes
+	-- Convertir a grados
+	local deg = math.deg
+	return string.format("(Yaw=%.1f°, Pitch=%.1f°, Roll=%.1f°)", deg(ry), deg(rx), deg(rz))
+end
+
+local function systemMessage(text)
+	-- Puedes comentar esto si NO quieres nada en el chat
+	pcall(function()
+		STARTER_GUI:SetCore("ChatMakeSystemMessage", {
+			Text = text;
+			Color = Color3.new(1,1,0);
+			Font = Enum.Font.SourceSansBold;
+			TextSize = 18;
+		})
+	end)
+	print(text)
+end
+
+---------------------------------------------------------------------
+-- Búsqueda de interior / carpetas
+---------------------------------------------------------------------
+local function findInteriorModel(timeout)
+	timeout = timeout or 5
+	local root = workspace:FindFirstChild("HouseInteriors")
+	if not root then return nil end
+	local t0 = tick()
+	while tick() - t0 < timeout do
+		for _, m in ipairs(root:GetDescendants()) do
+			if m:IsA("Model") and m:FindFirstChild("Walls") and m:FindFirstChild("Floors") and m:FindFirstChild("Doors") then
+				return m
+			end
+		end
+		task.wait(0.1)
+	end
+end
+
+local function findFurnitureFolder()
+	local root = workspace:FindFirstChild("HouseInteriors")
+	if not root then return nil end
+	for _, f in ipairs(root:GetDescendants()) do
+		if f:IsA("Folder") and f.Name == "furniture" then
+			return f
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Detección de textura (mejorada)
+---------------------------------------------------------------------
+local function getTextureFromPart(part: BasePart)
+	-- 1. MeshPart.TextureID
+	if part:IsA("MeshPart") and part.TextureID ~= "" then
+		return part.TextureID
+	end
+
+	-- 2. Decals
+	for _, ch in ipairs(part:GetChildren()) do
+		if ch:IsA("Decal") and ch.Texture ~= "" then
+			return ch.Texture
+		end
+	end
+
+	-- 3. Textures (legacy)
+	for _, ch in ipairs(part:GetChildren()) do
+		if ch:IsA("Texture") and ch.Texture ~= "" then
+			return ch.Texture
+		end
+	end
+
+	-- 4. SurfaceAppearance
+	for _, ch in ipairs(part:GetChildren()) do
+		if ch:IsA("SurfaceAppearance") then
+			if ch.ColorMap and ch.ColorMap ~= "" then return ch.ColorMap end
+			if ch.MetalnessMap and ch.MetalnessMap ~= "" then return ch.MetalnessMap end
+			if ch.RoughnessMap and ch.RoughnessMap ~= "" then return ch.RoughnessMap end
+		end
+	end
+
+	return "N/A"
+end
+
+---------------------------------------------------------------------
+-- Listados
+---------------------------------------------------------------------
+local function listBaseParts(folder: Instance)
+	local list = {}
+	if not folder then return list end
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(list, {
+				inst = d,
+				name = d.Name,
+				color = colorToHex(d.Color),
+				texture = getTextureFromPart(d),
+				pos = d.Position,
+				cf = d.CFrame,
+			})
+		end
+	end
+	return list
+end
+
+local function listTextures(folder: Instance) -- (para legacy separado si deseas)
+	local list = {}
+	if not folder then return list end
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("Texture") and d.Parent and d.Parent:IsA("BasePart") then
+			table.insert(list, {
+				inst = d,
+				name = "Texture "..d.Name.." ("..d.Parent.Name..")",
+				color = colorToHex(d.Color3),
+				texture = d.Texture,
+				pos = d.Parent.Position,
+				cf = d.Parent.CFrame,
+			})
+		elseif d:IsA("Decal") and d.Parent and d.Parent:IsA("BasePart") then
+			table.insert(list, {
+				inst = d,
+				name = "Decal "..d.Name.." ("..d.Parent.Name..")",
+				color = colorToHex(d.Color3),
+				texture = d.Texture,
+				pos = d.Parent.Position,
+				cf = d.Parent.CFrame,
+			})
+		end
+	end
+	return list
+end
+
+local function classifyWalls(wallsParts)
+	local paredes, ventanas, techos = {}, {}, {}
+	for _, info in ipairs(wallsParts) do
+		local nLower = string.lower(info.name)
+		if nLower:find("window") then
+			table.insert(ventanas, info)
+		elseif nLower:find("ceiling") or nLower:find("roof") then
+			table.insert(techos, info)
+		else
+			table.insert(paredes, info)
+		end
+	end
+	return paredes, ventanas, techos
+end
+
+-- Muebles (Model). Se toma la primera BasePart del modelo para sacar color/pos/texture.
+local function collectFurniture()
+	local folder = findFurnitureFolder()
+	local result = {}
+	if not folder then return result end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("Model") then
+			local foundColor, foundPos, foundCF, foundTexture
+			for _, p in ipairs(child:GetDescendants()) do
+				if p:IsA("BasePart") then
+					foundColor = colorToHex(p.Color)
+					foundPos = p.Position
+					foundCF = p.CFrame
+					foundTexture = getTextureFromPart(p)
+					break
+				end
+			end
+			table.insert(result, {
+				name = child.Name,
+				color = foundColor or "N/A",
+				pos = foundPos,
+				cf = foundCF,
+				texture = foundTexture or "N/A"
+			})
+		end
+	end
+	return result
+end
+
+---------------------------------------------------------------------
+-- Impresión
+---------------------------------------------------------------------
+local function dumpCategory(title, list)
+	if #list == 0 then
+		systemMessage(title..": (vacío)")
+	else
+		systemMessage(title..":")
+		for _, item in ipairs(list) do
+			systemMessage(string.format(
+				" - %s %s %s | Color=%s | Textura=%s",
+				item.name,
+				vecToStr(item.pos),
+				cfToAngles(item.cf),
+				item.color,
+				item.texture or "N/A"
+			))
+			task.wait()
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Reporte principal
+---------------------------------------------------------------------
+local function reportHouse()
+	local hi = ClientData.get("house_interior")
+	if not hi or not hi.player then
+		return
+	end
+
+	systemMessage(string.rep("-", 50))
+	systemMessage(("Propietario: %s | Tipo de casa: %s"):format(hi.player.Name, tostring(hi.building_type)))
+	systemMessage(("House ID: %s"):format(tostring(hi.house_id or "")))
+
+	local interior = findInteriorModel(5)
+	if not interior then
+		systemMessage("Interior no encontrado todavía (espera un momento y vuelve a entrar).")
+		return
+	end
+
+	local floorsFolder = interior:FindFirstChild("Floors")
+	local wallsFolder  = interior:FindFirstChild("Walls")
+	local doorsFolder  = interior:FindFirstChild("Doors")
+
+	local sueloParts    = listBaseParts(floorsFolder)
+	local wallsParts    = listBaseParts(wallsFolder)
+	local paredesParts, ventanasParts, techoParts = classifyWalls(wallsParts)
+	local puertasParts  = listBaseParts(doorsFolder)
+
+	-- Texturas sueltas (por si quieres ver elementos 'Texture/Decal' directamente)
+	local wallTextures  = listTextures(wallsFolder)
+	local floorTextures = listTextures(floorsFolder)
+
+	local muebles = collectFurniture()
+
+	dumpCategory("Muebles", muebles)
+	dumpCategory("Suelo (partes)", sueloParts)
+	dumpCategory("Texturas de suelo", floorTextures)
+	dumpCategory("Paredes (partes)", paredesParts)
+	dumpCategory("Ventanas", ventanasParts)
+	dumpCategory("Techo", techoParts)
+	dumpCategory("Texturas de paredes", wallTextures)
+	dumpCategory("Puertas", puertasParts)
+
+	systemMessage(string.rep("-", 50))
+end
+
+-- Callback cuando entras / cambias de interior
+ClientData.register_callback("house_interior", function(_,_,_)
+	task.delay(1, reportHouse)
+end)
+
+-- Intento inicial
+task.delay(2, reportHouse)
