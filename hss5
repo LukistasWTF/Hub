@@ -1,0 +1,227 @@
+-- DumpHouseInfo.lua
+-- Muestra TODA la información del interior de la casa y de cada mueble.
+
+local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
+local load = Fsys.load
+
+local ClientData            = load("ClientData")
+local InteriorsM            = load("InteriorsM")
+local FurnitureDB           = load("FurnitureDB")
+local FurnitureModelTracker = load("FurnitureModelTracker")
+local HttpService           = game:GetService("HttpService")
+
+--------------------------------------------------------------------
+-- Utilidades
+--------------------------------------------------------------------
+local function waitForHouseInterior(timeout)
+	local t0 = os.clock()
+	while true do
+		local interior = ClientData.get("house_interior")
+		local loc = InteriorsM.get_current_location()
+		if interior and loc and loc.destination_id == "housing" then
+			return interior
+		end
+		if timeout and os.clock() - t0 > timeout then
+			return nil
+		end
+		task.wait(0.2)
+	end
+end
+
+local function safeSerializeCF(cf)
+	if typeof(cf) == "CFrame" then
+		local p = cf.Position
+		local look = (cf - cf.Position).LookVector
+		return {
+			pos = {p.X, p.Y, p.Z},
+			look = {look.X, look.Y, look.Z},
+			raw = tostring(cf)
+		}
+	end
+	return cf
+end
+
+local function serializeColor(color)
+	if typeof(color) == "Color3" then
+		return {r=color.R, g=color.G, b=color.B, hex=color:ToHex()}
+	end
+	return color
+end
+
+local function shallowCopyTable(t)
+	local r = {}
+	for k,v in pairs(t) do
+		if typeof(v) == "Color3" then
+			r[k] = serializeColor(v)
+		elseif typeof(v) == "CFrame" then
+			r[k] = safeSerializeCF(v)
+		else
+			r[k] = v
+		end
+	end
+	return r
+end
+
+local function serializeModel(model)
+	if not model then return nil end
+	local info = {
+		name = model.Name,
+		fullName = model:GetFullName(),
+		attributes = model:GetAttributes(),
+		children = {},
+	}
+	-- Atributos -> convertir tipos básicos legibles
+	for a,v in pairs(info.attributes) do
+		if typeof(v) == "Color3" then
+			info.attributes[a] = serializeColor(v)
+		elseif typeof(v) == "CFrame" then
+			info.attributes[a] = safeSerializeCF(v)
+		end
+	end
+	-- Partes descendientes
+	for _,desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			table.insert(info.children, {
+				name = desc.Name,
+				class = desc.ClassName,
+				size = {desc.Size.X, desc.Size.Y, desc.Size.Z},
+				color = serializeColor(desc.Color),
+				transparency = desc.Transparency,
+				anchored = desc.Anchored,
+				cframe = safeSerializeCF(desc.CFrame)
+			})
+		end
+	end
+	return info
+end
+
+--------------------------------------------------------------------
+-- Volcado principal
+--------------------------------------------------------------------
+local function buildDump()
+	local interior = ClientData.get("house_interior")
+	if not interior then
+		return {error = "No hay interior cargado."}
+	end
+
+	-- Copiar datos generales del interior excepto la tabla furniture
+	local houseInfo = {}
+	for k,v in pairs(interior) do
+		if k ~= "furniture" then
+			if typeof(v) == "CFrame" then
+				houseInfo[k] = safeSerializeCF(v)
+			else
+				houseInfo[k] = v
+			end
+		end
+	end
+
+	-- Add-ons activos (según estructura que tenga tu juego)
+	local addons = {}
+	if interior.active_addons then
+		for _,name in ipairs(interior.active_addons) do
+			addons[name] = true
+		end
+	elseif interior.addons then
+		for name,enabled in pairs(interior.addons) do
+			if enabled then addons[name] = true end
+		end
+	end
+	houseInfo.active_addons_resolved = addons
+
+	-- Muebles
+	local furnitureDump = {}
+	for unique, data in pairs(interior.furniture or {}) do
+		local dbEntry = FurnitureDB[data.id]
+		local model = FurnitureModelTracker.get_furniture_by_unique(unique)
+
+		-- Serializar entrada DB (solo campos simples)
+		local dbSerialized
+		if dbEntry then
+			dbSerialized = {}
+			for k,v in pairs(dbEntry) do
+				if typeof(v) == "Color3" then
+					dbSerialized[k] = serializeColor(v)
+				elseif typeof(v) == "CFrame" then
+					dbSerialized[k] = safeSerializeCF(v)
+				else
+					dbSerialized[k] = v
+				end
+			end
+		end
+
+		local entry = {
+			unique = unique,
+			furniture_data = {
+				id = data.id,
+				cframe = safeSerializeCF(data.cframe),
+				scale = data.scale,
+				colors = data.colors, -- normalmente array de hex
+				mutated = data.mutated,
+				-- por si hay otros campos raros:
+			},
+			db = dbSerialized,
+			model = serializeModel(model),
+		}
+
+		-- Añadir cualquier otro campo presente en furniture_data que no hayamos puesto
+		for k,v in pairs(data) do
+			if entry.furniture_data[k] == nil then
+				if typeof(v) == "CFrame" then
+					entry.furniture_data[k] = safeSerializeCF(v)
+				elseif typeof(v) == "Color3" then
+					entry.furniture_data[k] = serializeColor(v)
+				else
+					entry.furniture_data[k] = v
+				end
+			end
+		end
+
+		furnitureDump[#furnitureDump+1] = entry
+	end
+
+	-- Ordenar por id de DB (opcional)
+	table.sort(furnitureDump, function(a,b)
+		return tostring(a.furniture_data.id) < tostring(b.furniture_data.id)
+	end)
+
+	return {
+		time = os.time(),
+		location = InteriorsM.get_current_location(),
+		house = houseInfo,
+		furniture_count = #furnitureDump,
+		furniture = furnitureDump
+	}
+end
+
+-- Función pública para reutilizar
+function DumpHouse()
+	local dump = buildDump()
+	local ok, json = pcall(function()
+		return HttpService:JSONEncode(dump)
+	end)
+	if ok then
+		print("===== DUMP CASA (JSON) =====")
+		print(json)
+	else
+		warn("Error codificando JSON:", json)
+		print("Tabla Lua:", dump)
+	end
+	return dump
+end
+
+--------------------------------------------------------------------
+-- Auto‑ejecución al cargar
+--------------------------------------------------------------------
+task.spawn(function()
+	local interior = waitForHouseInterior(30)
+	if not interior then
+		warn("[DumpHouse] No se cargó la casa en 30s.")
+		return
+	end
+	print("[DumpHouse] Casa detectada; generando volcado...")
+	DumpHouse()
+end)
+
+-- Puedes volver a llamar manualmente en la consola:
+-- > DumpHouse()
