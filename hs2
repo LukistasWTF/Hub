@@ -1,0 +1,123 @@
+-- LocalScript (StarterPlayerScripts)
+
+local load = require(game.ReplicatedStorage.Fsys).load
+-- Cambia "HousingModuleNombre" por el nombre correcto de tu módulo
+local Housing = load("HousingModuleNombre") 
+
+-- Utilidad para convertir un Color3 a texto (#RRGGBB)
+local function colorToHex(c: Color3)
+	return string.format("#%02X%02X%02X", math.floor(c.R*255), math.floor(c.G*255), math.floor(c.B*255))
+end
+
+-- Intenta localizar el modelo del interior actualmente cargado
+local function getCurrentInteriorModel()
+	local container = workspace:FindFirstChild("HouseInteriors")
+	if not container then return nil end
+
+	-- Cada “Blueprint” de Roact nos crea un Folder; dentro estará el modelo del interior
+	for _, folder in ipairs(container:GetChildren()) do
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Model") and child:FindFirstChild("Walls") and child:FindFirstChild("Doors") then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+-- Recolecta partes de un folder (Walls / Doors / Furniture) y devuelve { {name="...", color="#xxxxxx"}, ... }
+local function collectParts(folder: Instance)
+	local results = {}
+	if not folder then return results end
+	for _, desc in ipairs(folder:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			table.insert(results, {
+				name = desc:GetFullName(),
+				color = colorToHex(desc.Color)
+			})
+		end
+	end
+	return results
+end
+
+-- Muestra un mensaje de sistema en el chat
+local function systemMessage(text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
+			Text = text,
+			Color = Color3.new(1,1,0),
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 18
+		})
+	end)
+	print(text)
+end
+
+local function reportHouse()
+	local owner = Housing.get_current_house_owner()
+	if not owner then
+		systemMessage("[CASA] No hay interior cargado.")
+		return
+	end
+
+	local interior = getCurrentInteriorModel()
+	if not interior then
+		systemMessage("[CASA] No se encontró el modelo interior.")
+		return
+	end
+
+	local wallsFolder = interior:FindFirstChild("Walls")
+	local doorsFolder = interior:FindFirstChild("Doors")
+
+	-- Algunos juegos generan los muebles en otra estructura. Busca algo razonable:
+	local furnitureFolder = interior:FindFirstChild("Furniture") 
+	if not furnitureFolder then
+		-- A veces los muebles se instancian fuera del modelo interior. Si tienes un módulo AllFurniture crea un Folder aparte:
+		local possible = workspace:FindFirstChild("AllFurniture")
+		if possible then furnitureFolder = possible end
+	end
+
+	local walls   = collectParts(wallsFolder)
+	local doors   = collectParts(doorsFolder)
+	local furniture = collectParts(furnitureFolder)
+
+	systemMessage(string.format("[CASA] Propietario: %s", owner.Name))
+
+	local function listToString(list, title)
+		if #list == 0 then
+			return title..": (vacío)"
+		end
+		local lines = {title..":"}
+		for _, info in ipairs(list) do
+			table.insert(lines, string.format(" - %s (%s)", info.name, info.color))
+		end
+		return table.concat(lines, "\n")
+	end
+
+	local fullText = table.concat({
+		listToString(furniture, "Muebles"),
+		listToString(walls, "Paredes"),
+		listToString(doors, "Puertas"),
+	}, "\n")
+
+	-- Divide en varios mensajes si es muy largo
+	for segment in fullText:gmatch("[^\n]+") do
+		systemMessage(segment)
+		task.wait() -- evitar flood
+	end
+end
+
+-- Conectar al cambio de interior (cuando entras/sales)
+Housing.house_interior_changed:Connect(function(_, _, newValue)
+	-- newValue es la nueva info; si existe player => hemos entrado
+	if newValue and newValue.player then
+		task.delay(1, reportHouse) -- pequeño delay para que el modelo termine de montarse
+	end
+end)
+
+-- Por si ya estás dentro cuando se carga este script:
+task.delay(2, function()
+	if Housing.get_current_house_owner() then
+		reportHouse()
+	end
+end)
