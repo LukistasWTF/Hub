@@ -1,0 +1,150 @@
+-- LocalScript
+
+local load = require(game.ReplicatedStorage.Fsys).load
+local ClientData = load("ClientData")
+
+-- Color3 -> #RRGGBB
+local function colorToHex(c: Color3)
+	return string.format("#%02X%02X%02X", c.R*255, c.G*255, c.B*255)
+end
+
+local function systemMessage(text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
+			Text = text,
+			Color = Color3.new(1,1,0),
+			TextSize = 18,
+			Font = Enum.Font.SourceSansBold
+		})
+	end)
+	print(text)
+end
+
+-- Devuelve la carpeta raíz que monta Roact (workspace.HouseInteriors)
+local function getHouseInteriorsRoot()
+	return workspace:FindFirstChild("HouseInteriors")
+end
+
+-- Busca el modelo de interior (el que tiene Walls/Doors/Floors)
+local function findInteriorModel()
+	local root = getHouseInteriorsRoot()
+	if not root then return nil end
+	for _, m in ipairs(root:GetDescendants()) do
+		if m:IsA("Model") and m:FindFirstChild("Walls") and m:FindFirstChild("Doors") and m:FindFirstChild("Floors") then
+			return m
+		end
+	end
+end
+
+-- Carpeta “furniture” que monta el componente AllFurniture
+local function findFurnitureFolder()
+	local root = getHouseInteriorsRoot()
+	if not root then return nil end
+	for _, f in ipairs(root:GetDescendants()) do
+		if f:IsA("Folder") and f.Name == "furniture" then
+			return f
+		end
+	end
+end
+
+-- Recolecta paredes: cada Texture bajo interior.Walls
+local function collectWalls(interior)
+	local results = {}
+	local wallsFolder = interior:FindFirstChild("Walls")
+	if not wallsFolder then return results end
+	for _, inst in ipairs(wallsFolder:GetDescendants()) do
+		if inst:IsA("Texture") then
+			table.insert(results, {
+				name = inst.Name .. " (Texture on "..inst.Parent.Name..")",
+				color = colorToHex(inst.Color3)
+			})
+		end
+	end
+	return results
+end
+
+-- Recolecta puertas: BaseParts bajo interior.Doors
+local function collectDoors(interior)
+	local results = {}
+	local doorsFolder = interior:FindFirstChild("Doors")
+	if not doorsFolder then return results end
+	for _, inst in ipairs(doorsFolder:GetDescendants()) do
+		if inst:IsA("BasePart") then
+			table.insert(results, {
+				name = inst:GetFullName(),
+				color = colorToHex(inst.Color)
+			})
+		end
+	end
+	return results
+end
+
+-- Recolecta muebles: cada modelo hijo directo de la carpeta furniture.
+-- Para el color, usa el primer BasePart que encuentre dentro de ese modelo.
+local function collectFurniture()
+	local folder = findFurnitureFolder()
+	local results = {}
+	if not folder then return results end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("Model") then
+			local color = nil
+			for _, p in ipairs(child:GetDescendants()) do
+				if p:IsA("BasePart") then
+					color = color or colorToHex(p.Color)
+				end
+			end
+			table.insert(results, {
+				name = child.Name,
+				color = color or "N/A"
+			})
+		end
+	end
+	return results
+end
+
+local function dumpList(title, list)
+	if #list == 0 then
+		systemMessage(title..": (vacío)")
+		return
+	end
+	systemMessage(title..":")
+	for _, item in ipairs(list) do
+		systemMessage((" - %s (%s)"):format(item.name, item.color))
+		task.wait() -- evita flood
+	end
+end
+
+local function reportHouse()
+	local hi = ClientData.get("house_interior")
+	if not hi or not hi.player then return end
+
+	-- Esperar a que Roact monte el interior (hasta 5s)
+	local interior
+	for i = 1, 50 do
+		interior = findInteriorModel()
+		if interior then break end
+		task.wait(0.1)
+	end
+	if not interior then
+		systemMessage("[CASA] Interior no encontrado todavía.")
+		return
+	end
+
+	systemMessage("[CASA] Propietario: "..hi.player.Name)
+
+	local furniture = collectFurniture()
+	local walls = collectWalls(interior)
+	local doors = collectDoors(interior)
+
+	dumpList("Muebles", furniture)
+	dumpList("Paredes", walls)
+	dumpList("Puertas", doors)
+end
+
+-- Callback cuando entras/cambias de casa
+ClientData.register_callback("house_interior", function(_,_,_)
+	task.delay(1, reportHouse)
+end)
+
+-- Si ya estás dentro
+task.delay(2, reportHouse)
