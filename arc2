@@ -1,0 +1,600 @@
+-- DumpHouseInfoStreaming.lua
+-- Volcado masivo de casas (streaming). Genera dos JSON (básico y con hex).
+-- UI muestra último dump + progreso en tiempo real.
+
+---------------------------------------------------------------------
+-- Servicios / módulos
+---------------------------------------------------------------------
+local RS          = game:GetService("ReplicatedStorage")
+local Players     = game:GetService("Players")
+local LP          = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+local Fsys                 = require(RS:WaitForChild("Fsys"))
+local load                 = Fsys.load
+local Roact                = load("Roact")
+
+local ClientData            = load("ClientData")
+local InteriorsM            = load("InteriorsM")
+local FurnitureDB           = load("FurnitureDB")
+local FurnitureModelTracker = load("FurnitureModelTracker")
+
+local HouseClient
+pcall(function() HouseClient = load("HouseClient") end)
+
+---------------------------------------------------------------------
+-- Utilidades de serialización
+---------------------------------------------------------------------
+local function safeSerializeCF(cf)
+	if typeof(cf) == "CFrame" then
+		local p = cf.Position
+		local look = (cf - cf.Position).LookVector
+		return { __type = "CFrame", pos = {p.X,p.Y,p.Z}, look = {look.X,look.Y,look.Z} }
+	end
+	return cf
+end
+
+local function colorTable(color) -- sin hex
+	return { __type="Color3", r=color.R, g=color.G, b=color.B }
+end
+
+local function colorTableHex(color)
+	local r0,g0,b0 = color.R,color.G,color.B
+	local r = math.clamp(r0,0,1); local g = math.clamp(g0,0,1); local b = math.clamp(b0,0,1)
+	return {
+		__type="Color3", r=r0,g=g0,b=b0,
+		hex=string.format("%02X%02X%02X", r*255+0.5, g*255+0.5, b*255+0.5),
+		clamped = (r~=r0 or g~=g0 or b~=b0) or nil
+	}
+end
+
+local MAX_DEPTH = 4
+local function serializeValue(v, includeHex, depth, visited)
+	depth = depth or 0
+	if depth > MAX_DEPTH then return {__truncated=true,type=typeof(v)} end
+	local t = typeof(v)
+	if t == "number" or t == "string" or t == "boolean" or t == "nil" then
+		return v
+	elseif t == "Color3" then
+		return includeHex and colorTableHex(v) or colorTable(v)
+	elseif t == "CFrame" then
+		return safeSerializeCF(v)
+	elseif t == "Vector3" then
+		return {__type="Vector3",x=v.X,y=v.Y,z=v.Z}
+	elseif t == "ColorSequence" then
+		local out = {__type="ColorSequence",keypoints={}}
+		for _,kp in ipairs(v.Keypoints) do
+			table.insert(out.keypoints,{time=kp.Time,value=serializeValue(kp.Value,includeHex,depth+1,visited)})
+		end
+		return out
+	elseif t == "NumberSequence" then
+		local out = {__type="NumberSequence",keypoints={}}
+		for _,kp in ipairs(v.Keypoints) do
+			table.insert(out.keypoints,{time=kp.Time,value=kp.Value})
+		end
+		return out
+	elseif t == "Instance" then
+		return {__type="Instance",class=v.ClassName,name=v.Name,fullName=v:GetFullName()}
+	elseif t == "table" then
+		visited = visited or {}
+		if visited[v] then return {__ref="1"} end
+		visited[v] = true
+		local out = {}
+		for k,val in pairs(v) do
+			out[tostring(k)] = serializeValue(val, includeHex, depth+1, visited)
+		end
+		return out
+	end
+	return tostring(v)
+end
+
+-- Captura del modelo SOLO UNA VEZ -> luego se usa para básico y extendido
+local function captureModelRaw(model)
+	if not model then return nil end
+	local info = {
+		name = model.Name,
+		fullName = model:GetFullName(),
+		attributes = model:GetAttributes(),
+		children = {},
+	}
+	for _,desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			table.insert(info.children,{
+				name = desc.Name,
+				class = desc.ClassName,
+				size  = {desc.Size.X,desc.Size.Y,desc.Size.Z},
+				color = desc.Color,
+				transparency = desc.Transparency,
+				anchored = desc.Anchored,
+				cframe = desc.CFrame
+			})
+		end
+	end
+	return info
+end
+
+local function convertCapturedModel(raw, includeHex)
+	if not raw then return nil end
+	local out = {
+		name = raw.name,
+		fullName = raw.fullName,
+		attributes = {},
+		children = {},
+	}
+	for a,v in pairs(raw.attributes) do
+		out.attributes[a] = serializeValue(v, includeHex)
+	end
+	for _,p in ipairs(raw.children) do
+		table.insert(out.children,{
+			name=p.name,class=p.class,size=p.size,
+			color = includeHex and colorTableHex(p.color) or colorTable(p.color),
+			transparency=p.transparency,anchored=p.anchored,
+			cframe = safeSerializeCF(p.cframe)
+		})
+	end
+	return out
+end
+
+local function waitForHouseInterior(timeout)
+	local t0 = os.clock()
+	while true do
+		local interior = ClientData.get("house_interior")
+		local loc = InteriorsM.get_current_location()
+		if interior and loc and loc.destination_id == "housing" then
+			return interior
+		end
+		if timeout and os.clock() - t0 > timeout then return nil end
+		task.wait(0.2)
+	end
+end
+
+local function sanitize(str)
+	str = tostring(str or "unknown")
+	str = str:gsub("[^%w_%-]", "_")
+	if #str == 0 then str = "unknown" end
+	return str
+end
+
+local function resolveOwner(interior, loc)
+	if loc and loc.player then
+		if typeof(loc.player)=="Instance" and loc.player:IsA("Player") then return loc.player.Name end
+		return tostring(loc.player)
+	end
+	if interior.player then
+		if typeof(interior.player)=="Instance" and interior.player:IsA("Player") then return interior.player.Name end
+		return tostring(interior.player)
+	end
+	if HouseClient and HouseClient.get_current_house_owner then
+		local ok,res = pcall(HouseClient.get_current_house_owner)
+		if ok and res then
+			if typeof(res)=="Instance" and res:IsA("Player") then return res.Name end
+			return tostring(res)
+		end
+	end
+	local uid = interior.owner_user_id or interior.owner_id or interior.player_id
+	if typeof(uid)=="number" then
+		local plr = Players:GetPlayerByUserId(uid)
+		if plr then return plr.Name end
+		return "user"..uid
+	end
+	return "unknown"
+end
+
+---------------------------------------------------------------------
+-- Guardado incremental
+---------------------------------------------------------------------
+local function ensureFolder()
+	local pg = LP:WaitForChild("PlayerGui")
+	local folder = pg:FindFirstChild("HouseDump")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "HouseDump"
+		folder.Parent = pg
+	end
+	return folder
+end
+
+local function newGuiStreamSub(namePrefix)
+	local root = ensureFolder()
+	local sub = Instance.new("Folder")
+	sub.Name = namePrefix
+	sub.Parent = root
+	return sub
+end
+
+local function guiStreamAppend(sub, buffers, text)
+	local b = buffers.current .. text
+	if #b >= buffers.chunkSize then
+		local sv = Instance.new("StringValue")
+		buffers.index += 1
+		sv.Name = "Chunk_"..buffers.index
+		sv.Value = b
+		sv.Parent = sub
+		buffers.current = ""
+	else
+		buffers.current = b
+	end
+end
+
+local function guiStreamFlush(sub, buffers)
+	if buffers.current ~= "" then
+		local sv = Instance.new("StringValue")
+		buffers.index += 1
+		sv.Name = "Chunk_"..buffers.index
+		sv.Value = buffers.current
+		sv.Parent = sub
+		buffers.current = ""
+	end
+end
+
+local function openFileStreaming(filename, header)
+	local useAppend = appendfile ~= nil
+	if useAppend then
+		writefile(filename, header) -- crear nuevo
+	else
+		writefile(filename, header)
+	end
+	return {
+		filename = filename,
+		useAppend = useAppend,
+		buffer = header,
+	}
+end
+
+local function fileAppend(stream, text)
+	if stream.useAppend then
+		appendfile(stream.filename, text)
+	else
+		stream.buffer = stream.buffer .. text
+	end
+end
+
+local function fileClose(stream, footer)
+	if footer and footer ~= "" then fileAppend(stream, footer) end
+	if not stream.useAppend then
+		writefile(stream.filename, stream.buffer)
+	end
+end
+
+---------------------------------------------------------------------
+-- Eventos globales para la UI
+---------------------------------------------------------------------
+if not _G.__DumpHouseChangedEvent then
+	_G.__DumpHouseChangedEvent = Instance.new("BindableEvent")
+end
+if not _G.__DumpHouseProgressEvent then
+	_G.__DumpHouseProgressEvent = Instance.new("BindableEvent")
+end
+
+---------------------------------------------------------------------
+-- Función principal STREAMING
+---------------------------------------------------------------------
+local DUMP_IN_PROGRESS = false
+
+local function DumpHouse()
+	if DUMP_IN_PROGRESS then
+		warn("[DumpHouse] Ya hay un dump en curso.")
+		return
+	end
+	local interior = ClientData.get("house_interior")
+	local loc = InteriorsM.get_current_location()
+	if not interior or not loc then
+		warn("[DumpHouse] Casa no cargada.")
+		return
+	end
+
+	DUMP_IN_PROGRESS = true
+	task.spawn(function()
+		local startTime = os.clock()
+		local ownerName = sanitize(resolveOwner(interior, loc))
+		local houseType = sanitize(interior.building_type or interior.house_kind or interior.houseType or interior.kind or interior.id or "unknown")
+		local dateStr = os.date("%Y%m%d_%H%M%S")
+
+		-- Preparar lista de muebles (ordenados)
+		local furnitureMap = interior.furniture or {}
+		local furnitureList = {}
+		for unique,data in pairs(furnitureMap) do
+			table.insert(furnitureList,{unique=unique,data=data})
+		end
+		table.sort(furnitureList,function(a,b)
+			return tostring(a.data.id) < tostring(b.data.id)
+		end)
+		local total = #furnitureList
+
+		-- House / location (serializados una vez)
+		local houseInfoBasic, houseInfoHex = {}, {}
+		for k,v in pairs(interior) do
+			if k ~= "furniture" then
+				houseInfoBasic[k] = serializeValue(v,false)
+				houseInfoHex[k]   = serializeValue(v,true)
+			end
+		end
+		local addons = {}
+		if interior.active_addons then
+			for _,name in ipairs(interior.active_addons) do addons[name]=true end
+		elseif interior.addons then
+			for name,enabled in pairs(interior.addons) do if enabled then addons[name]=true end end
+		end
+		houseInfoBasic.active_addons_resolved = addons
+		houseInfoHex.active_addons_resolved = addons
+
+		local locDump
+		if loc then
+			locDump = { destination_id = loc.destination_id }
+			if loc.player then
+				locDump.player = (typeof(loc.player)=="Instance" and loc.player:IsA("Player")) and loc.player.Name or tostring(loc.player)
+			end
+		end
+
+		-- Cabeceras JSON
+		local headerBasic = {
+			time = os.time(),
+			location = locDump,
+			house = houseInfoBasic,
+			furniture_count = total,
+			furniture = "__STREAM__"
+		}
+		local headerHex = {
+			time = os.time(),
+			location = locDump,
+			house = houseInfoHex,
+			furniture_count = total,
+			furniture = "__STREAM__"
+		}
+
+		local function encodeHeader(tbl)
+			local clone = {}
+			for k,v in pairs(tbl) do if k ~= "furniture" then clone[k]=v end end
+			local json = HttpService:JSONEncode(clone)
+			return json:sub(1,#json-1)..',"furniture":['
+		end
+
+		local baseFile = string.format("dump_house_%s_%s_%s.json", ownerName, houseType, dateStr)
+		local extFile  = string.format("dump_house_%s_%s_%s_withhex.json", ownerName, houseType, dateStr)
+
+		local headerTextBasic = encodeHeader(headerBasic)
+		local headerTextHex   = encodeHeader(headerHex)
+
+		local streamBasic = openFileStreaming(baseFile, headerTextBasic)
+		local streamHex   = openFileStreaming(extFile , headerTextHex)
+
+		local guiBasicFolder = newGuiStreamSub("DumpBasic_"..dateStr)
+		local guiHexFolder   = newGuiStreamSub("DumpExtended_"..dateStr)
+		local guiB = {current="",index=0,chunkSize=50000}
+		local guiH = {current="",index=0,chunkSize=50000}
+		guiStreamAppend(guiBasicFolder, guiB, headerTextBasic)
+		guiStreamAppend(guiHexFolder,   guiH, headerTextHex)
+
+		local YIELD_EVERY = 25
+		for i,entry in ipairs(furnitureList) do
+			local unique = entry.unique
+			local data   = entry.data
+			local model  = FurnitureModelTracker.get_furniture_by_unique(unique)
+			local rawModel = captureModelRaw(model)
+
+			-- Datos comunes (básico)
+			local furnitureDataCommon = {
+				id = data.id,
+				cframe = serializeValue(data.cframe,false),
+				scale  = serializeValue(data.scale,false),
+				colors = serializeValue(data.colors,false),
+				mutated = data.mutated,
+			}
+			for k,v in pairs(data) do
+				if furnitureDataCommon[k]==nil then
+					furnitureDataCommon[k] = serializeValue(v,false)
+				end
+			end
+
+			local dbEntry = FurnitureDB[data.id]
+			local dbBasic
+			if dbEntry then
+				dbBasic = {}
+				for k,v in pairs(dbEntry) do
+					dbBasic[k] = serializeValue(v,false)
+				end
+			end
+
+			local basicEntry = {
+				unique = unique,
+				furniture_data = furnitureDataCommon,
+				db = dbBasic,
+				model = convertCapturedModel(rawModel,false),
+			}
+
+			-- Versión HEX
+			local furnitureDataHex = {}
+			for k,v in pairs(furnitureDataCommon) do
+				if k == "colors" then
+					furnitureDataHex[k] = serializeValue(data.colors,true)
+				else
+					furnitureDataHex[k] = v
+				end
+			end
+			local dbHex
+			if dbEntry then
+				dbHex = {}
+				for k,v in pairs(dbEntry) do
+					dbHex[k] = serializeValue(v,true)
+				end
+			end
+			local hexEntry = {
+				unique = unique,
+				furniture_data = furnitureDataHex,
+				db = dbHex,
+				model = convertCapturedModel(rawModel,true),
+			}
+
+			local ok1,jsonBasic = pcall(HttpService.JSONEncode, HttpService, basicEntry)
+			local ok2,jsonHex   = pcall(HttpService.JSONEncode, HttpService, hexEntry)
+			if ok1 and ok2 then
+				if i>1 then
+					fileAppend(streamBasic, ",")
+					fileAppend(streamHex, ",")
+					guiStreamAppend(guiBasicFolder, guiB, ",")
+					guiStreamAppend(guiHexFolder,   guiH, ",")
+				end
+				fileAppend(streamBasic, jsonBasic)
+				fileAppend(streamHex,   jsonHex)
+				guiStreamAppend(guiBasicFolder, guiB, jsonBasic)
+				guiStreamAppend(guiHexFolder,   guiH, jsonHex)
+			else
+				warn("[DumpHouse] Error codificando entrada "..i)
+			end
+
+			if i % YIELD_EVERY == 0 then task.wait() end
+			_G.__DumpHouseProgressEvent:Fire(i,total)
+		end
+
+		-- Cerrar arrays / streams
+		fileClose(streamBasic, "]}")
+		fileClose(streamHex,   "]}")
+
+		guiStreamAppend(guiBasicFolder, guiB, "]}")
+		guiStreamAppend(guiHexFolder,   guiH, "]}")
+		guiStreamFlush(guiBasicFolder, guiB)
+		guiStreamFlush(guiHexFolder,   guiH)
+
+		if setclipboard then pcall(setclipboard, baseFile) end
+
+		_G.__LAST_HOUSE_DUMP = {
+			time=os.time(), date=dateStr,
+			owner=ownerName, building_type=houseType,
+			furniture_count=total,
+			file_basic=baseFile, file_ext=extFile,
+			duration = os.clock()-startTime,
+		}
+
+		-- *** IMPORTANTE: liberar bandera antes de avisar a la UI ***
+		DUMP_IN_PROGRESS = false
+
+		_G.__DumpHouseChangedEvent:Fire(_G.__LAST_HOUSE_DUMP)
+		print("[DumpHouse] Finalizado en "..string.format("%.2f",os.clock()-startTime).."s. Total muebles: "..total)
+	end)
+end
+
+_G.DumpHouse = DumpHouse -- por si quieres llamar desde consola
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
+local App = Roact.Component:extend("DumpHouseApp")
+function App:init()
+	self.state = {
+		showUI = true,
+		last = _G.__LAST_HOUSE_DUMP,
+		status = "Esperando...",
+		progress = 0,
+		total = 0,
+	}
+	self.conn1 = _G.__DumpHouseChangedEvent.Event:Connect(function(info)
+		self:setState({last=info,status="Último dump OK",progress=info.furniture_count,total=info.furniture_count})
+	end)
+	self.conn2 = _G.__DumpHouseProgressEvent.Event:Connect(function(done,total)
+		self:setState({status=("Procesando %d/%d..."):format(done,total),progress=done,total=total})
+	end)
+end
+function App:willUnmount()
+	if self.conn1 then self.conn1:Disconnect() end
+	if self.conn2 then self.conn2:Disconnect() end
+end
+function App:render()
+	local s = self.state
+	local last = s.last
+	local infoText
+	if last then
+		infoText = string.format(
+			"Owner: %s\nTipo casa: %s\nMuebles: %d\nFecha: %s\nDuración: %.2fs\nArchivo básico: %s\nArchivo hex: %s",
+			last.owner,last.building_type,last.furniture_count or 0,last.date,last.duration or 0,last.file_basic or "-",last.file_ext or "-"
+		)
+	else
+		infoText = "Todavía no se ha hecho ningún volcado."
+	end
+
+	local pct = (s.total>0) and (s.progress/s.total) or 0
+
+	local ToggleButton = Roact.createElement("TextButton",{
+		Text="☰",Font=Enum.Font.GothamBold,TextSize=22,
+		BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),
+		Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,56),ZIndex=5,
+		[Roact.Event.Activated]=function() self:setState({showUI=not s.showUI}) end,
+	})
+
+	local FrameMain = Roact.createElement("Frame",{
+		Visible=s.showUI,
+		Size=UDim2.new(0,430,0,270),
+		Position=UDim2.new(0,60,0,60),
+		BackgroundColor3=Color3.fromRGB(30,30,30),BorderSizePixel=0,
+	},{
+		UICorner = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+		Title = Roact.createElement("TextLabel",{
+			Text="House Dump (Streaming)",Font=Enum.Font.GothamBold,TextSize=22,
+			BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+			Size=UDim2.new(1,-20,0,30),Position=UDim2.new(0,10,0,8),
+			TextXAlignment=Enum.TextXAlignment.Left,
+		}),
+		Status = Roact.createElement("TextLabel",{
+			Text=s.status,Font=Enum.Font.Gotham,TextSize=14,
+			BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),
+			Size=UDim2.new(1,-20,0,16),Position=UDim2.new(0,10,0,40),
+			TextXAlignment=Enum.TextXAlignment.Left,
+		}),
+		ProgressBG = Roact.createElement("Frame",{
+			Size=UDim2.new(1,-20,0,12),Position=UDim2.new(0,10,0,60),
+			BackgroundColor3=Color3.fromRGB(50,50,50),BorderSizePixel=0,
+		},{
+			UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}),
+			Fill=Roact.createElement("Frame",{
+				Size=UDim2.new(pct,0,1,0),
+				BackgroundColor3=Color3.fromRGB(80,150,90),BorderSizePixel=0,
+			},{
+				UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})
+			})
+		}),
+		InfoBox = Roact.createElement("TextLabel",{
+			Text=infoText,Font=Enum.Font.Gotham,TextSize=14,
+			BackgroundColor3=Color3.fromRGB(45,45,45),TextColor3=Color3.new(1,1,1),
+			TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+			Size=UDim2.new(1,-20,1,-140),Position=UDim2.new(0,10,0,80),
+			BorderSizePixel=0,
+		},{
+			UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+			Padding=Roact.createElement("UIPadding",{PaddingTop=UDim.new(0,6),PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)})
+		}),
+		DumpBtn = Roact.createElement("TextButton",{
+			Text=DUMP_IN_PROGRESS and "Dump en curso..." or "Dump now",
+			Font=Enum.Font.GothamBold,TextSize=18,
+			BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),
+			BorderSizePixel=0,Size=UDim2.new(1,-20,0,36),Position=UDim2.new(0,10,1,-44),
+			AutoButtonColor= not DUMP_IN_PROGRESS,
+			[Roact.Event.Activated]=function()
+				if not DUMP_IN_PROGRESS then
+					self:setState({status="Preparando...",progress=0,total=0})
+					DumpHouse()
+				end
+			end
+		}),
+	})
+
+	return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+		Toggle=ToggleButton, Main=FrameMain
+	})
+end
+
+Roact.mount(Roact.createElement(App), LP:WaitForChild("PlayerGui"))
+
+---------------------------------------------------------------------
+-- Auto‑ejecución inicial
+---------------------------------------------------------------------
+task.spawn(function()
+	local interior = waitForHouseInterior(30)
+	if not interior then
+		warn("[DumpHouse] No se cargó la casa en 30s.")
+		return
+	end
+	print("[DumpHouse] Casa detectada; generando volcado (streaming)...")
+	DumpHouse()
+end)
+
+-- DumpHouse() para ejecutar manualmente.
