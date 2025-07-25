@@ -1,0 +1,184 @@
+--══════════════════════════════════════════════════════════════════
+-- ReplicateHouseFromURL.lua
+--   • Input URL  → descarga dump_basic.json
+--   • Muestra metadatos y botón “Replicate”
+--   • Colocación progresiva (lotes) de texturas, add‑ons y muebles
+--══════════════════════════════════════════════════════════════════
+
+------------------------------------------------------------------  ajustes
+local ROUTE_ENTER_EDIT_MODE = "HousingAPI/EnterEditMode"
+local ROUTE_EXIT_EDIT_MODE  = "HousingAPI/ExitEditMode"
+local ROUTE_PLACE_FURNITURE = "HousingAPI/PlaceFurniture"
+local ROUTE_SET_TEXTURE     = "HousingAPI/SetRoomTexture"
+local ROUTE_MODIFY_ADDONS   = "HousingAPI/ModifyHouseAddons"
+
+local BATCH_SIZE   = 10      -- muebles por lote
+local WAIT_BATCH   = 0.12    -- pausa entre lotes
+local WAIT_TEXTURE = 0.05    -- pausa texturas/add‑ons
+------------------------------------------------------------------
+
+local RS,Players      = game:GetService("ReplicatedStorage"), game:GetService("Players")
+local LP              = Players.LocalPlayer
+local HttpService     = game:GetService("HttpService")
+local Fsys            = require(RS:WaitForChild("Fsys"))
+local load            = Fsys.load
+local Roact           = load("Roact")
+local RouterClient    = load("RouterClient")
+
+------------------------------------------------------------------  progress events
+local DownloadEvent   = Instance.new("BindableEvent")
+local ReplicateEvent  = Instance.new("BindableEvent")
+
+------------------------------------------------------------------  helper: enter/exit edit
+local function enterEdit() pcall(function() RouterClient.get(ROUTE_ENTER_EDIT_MODE):InvokeServer() end) end
+local function exitEdit()  pcall(function() RouterClient.get(ROUTE_EXIT_EDIT_MODE ):InvokeServer() end) end
+
+------------------------------------------------------------------  replicate procedure
+local function replicateHouse(dump)
+   task.spawn(function()
+      enterEdit()
+
+      -- texturas y add‑ons
+      if dump.house and dump.house.textures then
+         local setTex = RouterClient.get(ROUTE_SET_TEXTURE)
+         for roomId,room in pairs(dump.house.textures) do
+            for texType,texId in pairs(room) do
+               pcall(setTex.InvokeServer,setTex,roomId,texType,texId)
+               task.wait(WAIT_TEXTURE)
+            end
+         end
+      end
+      if dump.house and dump.house.active_addons_resolved then
+         pcall(function()
+            RouterClient.get(ROUTE_MODIFY_ADDONS):InvokeServer(
+               dump.house.house_id or 0,
+               dump.house.active_addons_resolved
+            )
+         end)
+      end
+
+      -- muebles
+      local furnArr = dump.furniture or {}
+      local place   = RouterClient.get(ROUTE_PLACE_FURNITURE)
+      for i,e in ipairs(furnArr) do
+         local f = e.furniture_data
+         pcall(function()
+            place:InvokeServer({
+               id      = f.id,
+               cframe  = f.cframe,
+               scale   = f.scale,
+               colors  = f.colors,
+            })
+         end)
+         if i%BATCH_SIZE==0 then task.wait(WAIT_BATCH) end
+         ReplicateEvent:Fire(i,#furnArr)
+      end
+      exitEdit()
+   end)
+end
+
+------------------------------------------------------------------  UI component
+local Ui = Roact.Component:extend("ReplicateUi")
+function Ui:init()
+   self.state = {
+      show     = true,
+      url      = "",
+      status   = "Waiting URL…",
+      info     = nil,   -- tabla con metadatos
+      progress = 0,
+      total    = 1,
+      downloading = false,
+      replicating = false,
+   }
+
+   self.dlConn = DownloadEvent.Event:Connect(function(done,total)
+      self:setState{status=("Downloading %d/%d KB…"):format(done,total)}
+   end)
+   self.repConn = ReplicateEvent.Event:Connect(function(done,total)
+      self:setState{progress=done,total=total,status=("Replicating %d/%d…"):format(done,total)}
+   end)
+end
+function Ui:willUnmount() self.dlConn:Disconnect(); self.repConn:Disconnect() end
+
+function Ui:render()
+   local s = self.state
+   local pct = s.total>0 and s.progress/s.total or 0
+   local meta = s.info and string.format(
+      "Owner: %s\nType: %s\nFurniture: %d\nDate: %s",
+      s.info.owner or"‑",s.info.building_type or"‑",
+      s.info.furniture_count or0, os.date("%c",s.info.time or 0)
+   ) or "No dump loaded yet."
+
+   return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+      Toggle=Roact.createElement("TextButton",{Text="☰",Font=Enum.Font.GothamBold,TextSize=22,
+         BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),
+         Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,56),
+         [Roact.Event.Activated]=function() self:setState{show=not s.show} end}),
+      Main=Roact.createElement("Frame",{Visible=s.show,Size=UDim2.new(0,430,0,250),
+         Position=UDim2.new(0,60,0,60),BackgroundColor3=Color3.fromRGB(30,30,30),BorderSizePixel=0},{
+         UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+         Title=Roact.createElement("TextLabel",{Text="Replicate House (URL)",Font=Enum.Font.GothamBold,TextSize=22,
+            BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(1,-20,0,28),Position=UDim2.new(0,10,0,8),TextXAlignment=Enum.TextXAlignment.Left}),
+         UrlBox=Roact.createElement("TextBox",{PlaceholderText="https://…/dump_house_*.json",
+            Text=s.url,Font=Enum.Font.Code,TextSize=14,ClearTextOnFocus=false,
+            BackgroundColor3=Color3.fromRGB(45,45,60),TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(1,-20,0,28),Position=UDim2.new(0,10,0,38),
+            [Roact.Change.Text]=function(r) self:setState{url=r.Text} end},{
+            UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})}),
+         Status=Roact.createElement("TextLabel",{Text=s.status,Font=Enum.Font.Gotham,TextSize=14,
+            BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),
+            Size=UDim2.new(1,-20,0,18),Position=UDim2.new(0,10,0,70),TextXAlignment=Enum.TextXAlignment.Left}),
+         Prog=Roact.createElement("Frame",{Size=UDim2.new(1,-20,0,10),Position=UDim2.new(0,10,0,90),
+            BackgroundColor3=Color3.fromRGB(55,55,55),BorderSizePixel=0},{
+            Fill=Roact.createElement("Frame",{Size=UDim2.new(pct,0,1,0),
+               BackgroundColor3=Color3.fromRGB(60,120,200),BorderSizePixel=0})}),
+         Info=Roact.createElement("TextLabel",{Text=meta,Font=Enum.Font.Gotham,TextSize=14,
+            BackgroundColor3=Color3.fromRGB(45,45,45),TextColor3=Color3.new(1,1,1),
+            TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+            Size=UDim2.new(1,-20,1,-140),Position=UDim2.new(0,10,0,110),BorderSizePixel=0},{
+            UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+         BtnLoad=Roact.createElement("TextButton",{Text=s.downloading and"Loading…"or"Load JSON",
+            Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(0.48,-12,0,36),Position=UDim2.new(0,10,1,-46),
+            AutoButtonColor=not s.downloading,
+            [Roact.Event.Activated]=function()
+               if s.downloading then return end
+               local url=s.url
+               if not url:match("^https?://") then
+                  self:setState{status="❌ URL no válida."}; return
+               end
+               self:setState{downloading=true,status="Starting download…",progress=0,total=1}
+               task.spawn(function()
+                  local ok,res = pcall(function() return HttpService:GetAsync(url,false) end)
+                  if not ok then
+                     self:setState{status="❌ Error: "..tostring(res),downloading=false};return
+                  end
+                  local j
+                  ok,res = pcall(HttpService.JSONDecode,HttpService,res)
+                  if not ok then
+                     self:setState{status="❌ JSON mal formado",downloading=false};return
+                  end
+                  j=res
+                  self.dumpLoaded = j
+                  self:setState{status="JSON OK",info={owner=j.house.player or "?",building_type=j.house.building_type or "?",
+                     furniture_count=j.furniture_count or 0,time=j.time},downloading=false,progress=0,total=1}
+               end)
+            end}),
+         BtnRep=Roact.createElement("TextButton",{Text=s.replicating and"Replicating…"or"Replicate",
+            Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundColor3=Color3.fromRGB(60,120,200),TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(0.48,-12,0,36),Position=UDim2.new(0.52,2,1,-46),
+            AutoButtonColor=not s.replicating,
+            [Roact.Event.Activated]=function()
+               if self.dumpLoaded and not s.replicating then
+                  self:setState{replicating=true,status="Replicating…",progress=0,total=self.dumpLoaded.furniture_count or 1}
+                  replicateHouse(self.dumpLoaded)
+               end
+            end})
+      })
+   })
+end
+
+Roact.mount(Roact.createElement(Ui),LP:WaitForChild("PlayerGui"))
