@@ -1,0 +1,528 @@
+--═════════════════════════════════════════════════════════════════════
+--  ReplicateHouseFromURL.lua  (1‑by‑1 BuyFurnitures)  V5.2
+--    • Dump V2: world_cf / local_cf / interior_root_cf
+--    • Transforma SIEMPRE a local del dump → local del interior actual
+--    • Coloca uno a uno; respeta colores/escala
+--    • UI con progreso; botón reutilizable al terminar
+--═════════════════════════════════════════════════════════════════════
+
+--------------------------------------------------------------------- ajustes
+local WAIT_EACH_FURNI   = 0.07  -- pausa entre compras (anti-flood)
+local RETRIES_PER_ITEM  = 2     -- reintentos por mueble si falla
+local WAIT_TEXTURE      = 0.05  -- pausa entre texturas
+local VERIFY_LOG_EPS    = 1e-4  -- delta para log de diagnóstico
+
+--------------------------------------------------------------------- servicios
+local RS          = game:GetService("ReplicatedStorage")
+local Players     = game:GetService("Players")
+local LP          = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+--------------------------------------------------------------------- Fsys / módulos (carga segura)
+local FsysModule = require(RS:WaitForChild("Fsys"))
+local FSLOAD     = assert(FsysModule and FsysModule.load, "[Replicate] Fsys.load es nil")
+
+local function Load(name)
+    local ok, mod = pcall(FSLOAD, name)
+    assert(ok and mod ~= nil, ("[Replicate] No se pudo cargar '%s'"):format(tostring(name)))
+    return mod
+end
+
+local Roact        = Load("Roact")
+local RouterClient = Load("RouterClient")
+local HouseClient  = Load("HouseClient")
+local InteriorsM   = Load("InteriorsM")
+local FurnitureModelTracker = (function() local ok,m=pcall(Load,"FurnitureModelTracker"); return ok and m or nil end)()
+
+--------------------------------------------------------------------- Router helpers
+local function RC(route)
+    local r = RouterClient.get(route)
+    if not r then warn("[Replicate] RouterClient no tiene '"..route.."'") end
+    return r
+end
+local function rcInvoke(route, ...)
+    local r = RC(route)
+    if not r or not r.InvokeServer then return false, "remote nil" end
+    return pcall(r.InvokeServer, r, ...)
+end
+local function rcFire(route, ...)
+    local r = RC(route)
+    if r and r.FireServer then pcall(r.FireServer, r, ...) end
+end
+
+--------------------------------------------------------------------- edit‑mode (manual preferente)
+local function waitForEditMode(timeout)
+    local t0 = tick()
+    while true do
+        local ok, isOn = pcall(HouseClient.is_edit_mode_active)
+        if ok and isOn then return true end
+        if timeout and (tick() - t0) > timeout then return false end
+        task.wait(0.2)
+    end
+end
+
+--------------------------------------------------------------------- proxy HTTP (executor -> httpget -> RF)
+local proxyRF
+local function getProxy()
+    if proxyRF then return proxyRF end
+    proxyRF = Instance.new("RemoteFunction")
+    proxyRF.Name = "__ReplicateHttpProxy"
+    proxyRF.Parent = RS
+    proxyRF.OnServerInvoke = function(_, url)
+        local ok, res = pcall(HttpService.GetAsync, HttpService, url, false)
+        return ok, ok and res or tostring(res)
+    end
+    return proxyRF
+end
+
+local function httpFetch(url)
+    local req = (syn and syn.request) or (http and http.request) or request
+    if req then
+        local r = req{Url=url, Method="GET"}
+        if r and r.StatusCode == 200 then return r.Body end
+    end
+    if game.HttpGet then
+        local ok, body = pcall(game.HttpGet, game, url)
+        if ok then return body end
+    end
+    local ok, res = getProxy():InvokeServer(url)
+    if ok then return res end
+    error(res)
+end
+
+--------------------------------------------------------------------- util CFrame/Color reconstrucción
+local function c3(v)
+    if typeof(v)=="Color3" then return v end
+    if type(v)=="table" then
+        if v.__type=="Color3" then
+            local r,g,b = tonumber(v.r) or 0, tonumber(v.g) or 0, tonumber(v.b) or 0
+            -- soporta dumps en 0..1 (normal) o 0..255
+            if r>1 or g>1 or b>1 then r=r/255; g=g/255; b=b/255 end
+            return Color3.new(r, g, b)
+        end
+        if v[1] and v[2] and v[3] then
+            local r,g,b = v[1],v[2],v[3]
+            if r>1 or g>1 or b>1 then r=r/255; g=g/255; b=b/255 end
+            return Color3.new(r,g,b)
+        end
+        if v.hex and type(v.hex)=="string" and #v.hex==6 then
+            local n = tonumber(v.hex,16) or 0
+            local r = math.floor(n/65536)%256
+            local g = math.floor(n/256)%256
+            local b = n%256
+            return Color3.fromRGB(r,g,b)
+        end
+    end
+end
+local function toColors(tbl)
+    if not tbl then return nil end
+    if typeof(tbl)=="Color3" then return {tbl} end
+    if type(tbl)=="table" then
+        local out={}
+        for k,val in pairs(tbl) do
+            local col = c3(val)
+            if col then out[k]=col end
+        end
+        return next(out) and out or nil
+    end
+    return nil
+end
+local function toV3(v)
+    if typeof(v)=="Vector3" then return v end
+    if type(v)=="number" then return Vector3.new(v,v,v) end
+    if type(v)=="table" then
+        if v.__type=="Vector3" then
+            return Vector3.new(v.x or v[1] or 0, v.y or v[2] or 0, v.z or v[3] or 0)
+        end
+        if v[1] and v[2] and v[3] then
+            return Vector3.new(v[1], v[2], v[3])
+        end
+    end
+end
+
+-- basis_v2 -> CFrame
+local function cf_from_basis(tbl)
+    local p = Vector3.new(tbl.pos[1], tbl.pos[2], tbl.pos[3])
+    local r = Vector3.new(tbl.right[1], tbl.right[2], tbl.right[3])
+    local u = Vector3.new(tbl.up[1],    tbl.up[2],    tbl.up[3])
+    return CFrame.fromMatrix(p, r, u)
+end
+
+local function toCF_legacy(v)
+    if typeof(v)=="CFrame" then return v end
+    if type(v)=="table" and v.__type=="CFrame" then
+        if v.pos and v.right and v.up then
+            return cf_from_basis(v)
+        end
+        if v.pos and v.look then
+            local p  = Vector3.new(v.pos[1], v.pos[2], v.pos[3])
+            local lv = Vector3.new(v.look[1],v.look[2],v.look[3])
+            return CFrame.lookAt(p, p + lv)
+        end
+        if v.pos and v.axis and v.angle then
+            local p    = Vector3.new(v.pos[1], v.pos[2], v.pos[3])
+            local axis = Vector3.new(v.axis[1], v.axis[2], v.axis[3]).Unit
+            return CFrame.fromAxisAngle(axis, v.angle) + p
+        end
+    end
+    return CFrame.new()
+end
+
+--------------------------------------------------------------------- interior root
+local function tryCall(mod, method, ...)
+    if not mod then return nil end
+    local f = mod[method]
+    if type(f) ~= "function" then return nil end
+    local ok, res = pcall(f, ...)
+    if ok then return res end
+    return nil
+end
+
+local function findInteriorRootModel()
+    local loc = tryCall(InteriorsM, "get_current_location")
+    if type(loc)=="table" then
+        if typeof(loc.model)=="Instance" then return loc.model end
+        if typeof(loc.container)=="Instance" then return loc.container end
+    end
+    -- fallback: intenta subir desde algún mueble
+    if FurnitureModelTracker and FurnitureModelTracker.get_all_furniture then
+        local list = FurnitureModelTracker.get_all_furniture()
+        for _,mdl in pairs(list) do
+            local top = mdl
+            while top and top.Parent and top.Parent ~= workspace do
+                top = top.Parent
+            end
+            if top then return top end
+        end
+    end
+    return nil
+end
+
+local function getPivotCF(inst)
+    if not inst then return nil end
+    if inst:IsA("Model") then
+        local ok, cf = pcall(inst.GetPivot, inst)
+        if ok then return cf end
+    elseif inst:IsA("BasePart") then
+        return inst.CFrame
+    end
+    return nil
+end
+
+-- Lee el root del dump en cualquiera de los sitios habituales
+local function getDumpRootCF(dump)
+    local cfTbl =
+        (dump.space and dump.space.interior_root_cf) or
+        (dump.house and dump.house.interior_root_cf) or
+        dump.interior_root_cf
+    if cfTbl then return toCF_legacy(cfTbl) end
+end
+
+--------------------------------------------------------------------- progreso UI
+local ReplicateEvent = Instance.new("BindableEvent") -- (done,total)
+local StepEvent      = Instance.new("BindableEvent") -- fase
+local DoneEvent      = Instance.new("BindableEvent") -- fin
+
+--------------------------------------------------------------------- colocar 1 mueble (BuyFurnitures uno a uno)
+local function placeOne(kind, props)
+    local payload = { { kind = kind, properties = props } }
+    local ok,res = rcInvoke("HousingAPI/BuyFurnitures", payload)
+    if not ok then return false, "pcall "..tostring(res) end
+    if type(res)=="table" and res.success==false then
+        return false, tostring(res.status or "failed")
+    end
+    return true
+end
+
+--------------------------------------------------------------------- construcción del CFrame objetivo
+-- Convierte SIEMPRE desde el sistema del dump al actual:
+--   • Si hay local_cf → currentRoot * local_cf
+--   • Si hay world_cf → local_dump = dumpRoot:ToObjectSpace(world) → currentRoot * local_dump
+--   • Si sólo hay f.cframe (world viejo) → misma conversión con dumpRoot si existe
+local function computeTargetWorldCF(entry, dumpRootCF, currentRootCF)
+    local f  = entry.furniture_data or entry
+    local sp = entry.space
+
+    if sp and sp.local_cf and currentRootCF then
+        local local_cf = toCF_legacy(sp.local_cf)
+        return currentRootCF:ToWorldSpace(local_cf), "local→world"
+    end
+
+    if sp and sp.world_cf then
+        local world_in_dump = toCF_legacy(sp.world_cf)
+        if dumpRootCF and currentRootCF then
+            local local_in_dump = dumpRootCF:ToObjectSpace(world_in_dump)
+            return currentRootCF:ToWorldSpace(local_in_dump), "world→local→world"
+        else
+            return world_in_dump, "world (no root)"
+        end
+    end
+
+    if f.cframe then
+        local world_old = toCF_legacy(f.cframe)
+        if dumpRootCF and currentRootCF then
+            local local_in_dump = dumpRootCF:ToObjectSpace(world_old)
+            return currentRootCF:ToWorldSpace(local_in_dump), "legacy→local→world"
+        else
+            return world_old, "legacy (no root)"
+        end
+    end
+
+    return CFrame.new(), "identity"
+end
+
+--------------------------------------------------------------------- rutina principal
+local function replicateHouse(dump, setStatus)
+    task.spawn(function()
+        -------------------------------------------------------------- entrar en edición
+        local okEdit, isOn = pcall(HouseClient.is_edit_mode_active)
+        if not (okEdit and isOn) then
+            setStatus("Pulsa *Edit House* (15s)…")
+            if not waitForEditMode(15) then
+                rcFire("HousingAPI/SendHousingOnePointOneLog","edit_state_entered",{house_type="mine"})
+                if not waitForEditMode(5) then
+                    setStatus("❌ No se pudo entrar en modo edición."); DoneEvent:Fire(); return
+                end
+            end
+        end
+        setStatus("✓ Edit mode detectado")
+
+        -------------------------------------------------------------- roots
+        local currentRootModel = findInteriorRootModel()
+        local currentRootCF    = getPivotCF(currentRootModel) or CFrame.new()
+        local dumpRootCF       = getDumpRootCF(dump) -- puede ser nil si dump viejo
+
+        -------------------------------------------------------------- texturas
+        StepEvent:Fire("Textures")
+        if dump.house and dump.house.textures then
+            for roomId, room in pairs(dump.house.textures) do
+                for texType, texId in pairs(room) do
+                    rcFire("HousingAPI/BuyTexture", roomId, texType, texId)
+                    task.wait(WAIT_TEXTURE)
+                end
+            end
+        end
+
+        -------------------------------------------------------------- muebles
+        StepEvent:Fire("Furniture")
+        local list  = dump.furniture or {}
+        local total = #list
+        for i, entry in ipairs(list) do
+            local f = entry.furniture_data or entry
+
+            -- CFrame objetivo en el MUNDO ACTUAL (aplicando conversión de espacios)
+            local targetCF, mode = computeTargetWorldCF(entry, dumpRootCF, currentRootCF)
+
+            -- propiedades exactas
+            local props = { cframe = targetCF }
+            local sc = toV3(f.scale);  if sc   then props.scale  = sc   end
+            local cs = toColors(f.colors); if cs then props.colors = cs  end
+
+            -- reintentos (si falla, alterna espacio cuando sea posible)
+            local ok,err
+            for attempt=1,(1+RETRIES_PER_ITEM) do
+                ok,err = placeOne(f.id or f.kind, props)
+                if ok then break end
+                task.wait(0.15)
+                if attempt==1 and entry.space then
+                    if entry.space.local_cf and mode~="local→world" and currentRootCF then
+                        props.cframe = currentRootCF:ToWorldSpace(toCF_legacy(entry.space.local_cf))
+                        mode = "local→world (fallback)"
+                    elseif entry.space.world_cf and mode~="world→local→world" then
+                        local world_in_dump = toCF_legacy(entry.space.world_cf)
+                        if dumpRootCF and currentRootCF then
+                            local local_in_dump = dumpRootCF:ToObjectSpace(world_in_dump)
+                            props.cframe = currentRootCF:ToWorldSpace(local_in_dump)
+                            mode = "world→local→world (fallback)"
+                        else
+                            props.cframe = world_in_dump
+                            mode = "world (no root)"
+                        end
+                    end
+                end
+            end
+
+            if not ok then
+                warn(("[Replicate] Falló '%s' (%d/%d): %s"):format(tostring(f.id or f.kind), i, total, tostring(err)))
+            else
+                -- verificación opcional contra world_cf del dump
+                if entry.space and entry.space.world_cf and dumpRootCF then
+                    local expected_world_dump = toCF_legacy(entry.space.world_cf)
+                    local expected_local_dump = dumpRootCF:ToObjectSpace(expected_world_dump)
+                    local expected_here       = currentRootCF:ToWorldSpace(expected_local_dump)
+                    local dp = (expected_here.Position - props.cframe.Position).Magnitude
+                    if dp > VERIFY_LOG_EPS then
+                        print(("[Replicate] Δpos=%.6f via %s"):format(dp, mode))
+                    end
+                end
+            end
+
+            ReplicateEvent:Fire(i, total)
+            task.wait(WAIT_EACH_FURNI)
+        end
+
+        rcFire("HousingAPI/SendHousingOnePointOneLog","edit_state_exited",{}) -- opcional
+        setStatus("✅ Replicación completada")
+        DoneEvent:Fire()
+    end)
+end
+
+--------------------------------------------------------------------- UI
+local Ui = Roact.Component:extend("ReplicateUi")
+
+function Ui:init()
+    self.state = {
+        visible     = true,
+        url         = "",
+        status      = "Esperando URL…",
+        meta        = nil,
+        prog        = 0,
+        total       = 1,
+        downloading = false,
+        replicating = false,
+        phase       = ""
+    }
+
+    self.repConn  = ReplicateEvent.Event:Connect(function(done,total)
+        self:setState{prog=done,total=total,status=string.format("Replicando %d/%d…",done,total)}
+    end)
+    self.stepConn = StepEvent.Event:Connect(function(phase)
+        self:setState{phase=tostring(phase or "")}
+    end)
+    self.doneConn = DoneEvent.Event:Connect(function()
+        self:setState{replicating=false, phase=""} -- liberar botón
+    end)
+end
+function Ui:willUnmount()
+    if self.repConn  then self.repConn:Disconnect() end
+    if self.stepConn then self.stepConn:Disconnect() end
+    if self.doneConn then self.doneConn:Disconnect() end
+end
+
+local function metaToString(meta)
+    if not meta then return "No dump loaded." end
+    return string.format(
+        "Owner: %s\nType: %s\nFurniture: %d\nDate: %s\nFormat: %s / Root: %s",
+        tostring(meta.owner or "‑"),
+        tostring(meta.building_type or "‑"),
+        tonumber(meta.furniture_count or 0) or 0,
+        os.date("%c", tonumber(meta.time) or 0),
+        tostring((meta.format and meta.format.cframe) or "-"),
+        (meta.format and (meta.format.space or "local/world")) or "-"
+    )
+end
+
+function Ui:render()
+    local s = self.state
+    local pct = s.prog / math.max(1, s.total)
+
+    return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+        Toggle = Roact.createElement("TextButton",{
+            Text="☰", Font=Enum.Font.GothamBold, TextSize=22,
+            BackgroundColor3=Color3.fromRGB(50,50,90), TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(0,36,0,36), Position=UDim2.new(0,10,0,56),
+            [Roact.Event.Activated]=function() self:setState{visible=not s.visible} end,
+        }),
+
+        Window = Roact.createElement("Frame",{
+            Visible=s.visible, Size=UDim2.new(0,460,0,270),
+            Position=UDim2.new(0,60,0,60),
+            BackgroundColor3=Color3.fromRGB(30,30,30), BorderSizePixel=0,
+        },{
+            Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+            Title = Roact.createElement("TextLabel",{
+                Text="Replicate House (URL) – V5.2", Font=Enum.Font.GothamBold, TextSize=22,
+                BackgroundTransparency=1, TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(1,-20,0,28), Position=UDim2.new(0,10,0,8),
+                TextXAlignment=Enum.TextXAlignment.Left,
+            }),
+
+            UrlBox = Roact.createElement("TextBox",{
+                PlaceholderText="https://…/dump_house_*.json",
+                Text=s.url, Font=Enum.Font.Code, TextSize=14, ClearTextOnFocus=false,
+                BackgroundColor3=Color3.fromRGB(45,45,60), TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(1,-20,0,28), Position=UDim2.new(0,10,0,38),
+                [Roact.Change.Text]=function(r) self:setState{url=r.Text} end,
+            },{Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})}),
+
+            Status = Roact.createElement("TextLabel",{
+                Text = (s.phase~="" and ("["..s.phase.."] ") or "") .. s.status,
+                Font=Enum.Font.Gotham, TextSize=14,
+                BackgroundTransparency=1, TextColor3=Color3.fromRGB(200,200,200),
+                Size=UDim2.new(1,-20,0,18), Position=UDim2.new(0,10,0,70),
+                TextXAlignment=Enum.TextXAlignment.Left,
+            }),
+
+            ProgBG = Roact.createElement("Frame",{
+                Size=UDim2.new(1,-20,0,10), Position=UDim2.new(0,10,0,90),
+                BackgroundColor3=Color3.fromRGB(55,55,55), BorderSizePixel=0,
+            },{
+                Fill = Roact.createElement("Frame",{
+                    Size=UDim2.new(pct,0,1,0),
+                    BackgroundColor3=Color3.fromRGB(60,120,200), BorderSizePixel=0,
+                })
+            }),
+
+            Info = Roact.createElement("TextLabel",{
+                Text=metaToString(s.meta), Font=Enum.Font.Gotham, TextSize=14,
+                BackgroundColor3=Color3.fromRGB(45,45,45), TextColor3=Color3.new(1,1,1),
+                TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Top,
+                Size=UDim2.new(1,-20,1,-140), Position=UDim2.new(0,10,0,110),
+                BorderSizePixel=0,
+            },{Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+
+            BtnLoad = Roact.createElement("TextButton",{
+                Text=s.downloading and "Loading…" or "Load JSON",
+                Font=Enum.Font.GothamBold, TextSize=18,
+                BackgroundColor3=Color3.fromRGB(80,150,90), TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(0.48,-12,0,36), Position=UDim2.new(0,10,1,-46),
+                AutoButtonColor=not s.downloading,
+                [Roact.Event.Activated]=function()
+                    if s.downloading then return end
+                    local url=s.url
+                    if not url:match("^https?://") then
+                        self:setState{status="❌ URL no válida."}; return
+                    end
+                    self:setState{downloading=true,status="Descargando…",prog=0,total=1,phase=""}
+                    task.spawn(function()
+                        local ok, body = pcall(httpFetch, url)
+                        if not ok then self:setState{status="❌ "..tostring(body),downloading=false}; return end
+                        local ok2, dump = pcall(HttpService.JSONDecode, HttpService, body)
+                        if not ok2 then self:setState{status="❌ JSON mal formado",downloading=false}; return end
+                        self.dumpLoaded = dump
+                        local h = dump.house or {}
+                        self:setState{
+                            downloading=false, status="JSON OK",
+                            meta = {
+                                owner           = h.player or h.owner or "?",
+                                building_type   = h.building_type or "?",
+                                furniture_count = dump.furniture_count or #(dump.furniture or {}),
+                                time            = dump.time,
+                                format          = dump.format,
+                            },
+                            prog=0, total=1
+                        }
+                    end)
+                end,
+            }),
+
+            BtnRep = Roact.createElement("TextButton",{
+                Text=s.replicating and "Replicating…" or "Replicate",
+                Font=Enum.Font.GothamBold, TextSize=18,
+                BackgroundColor3=Color3.fromRGB(60,120,200), TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(0.48,-12,0,36), Position=UDim2.new(0.52,2,1,-46),
+                AutoButtonColor=not s.replicating,
+                [Roact.Event.Activated]=function()
+                    if self.dumpLoaded and not s.replicating then
+                        local total = self.dumpLoaded.furniture_count or #(self.dumpLoaded.furniture or {})
+                        self:setState{replicating=true,status="Replicando…",prog=0,total=total,phase=""}
+                        replicateHouse(self.dumpLoaded,function(txt) self:setState{status=txt} end)
+                    end
+                end,
+            }),
+        }),
+    })
+end
+
+Roact.mount(Roact.createElement(Ui), LP:WaitForChild("PlayerGui"))
