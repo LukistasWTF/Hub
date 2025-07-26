@@ -1,0 +1,447 @@
+--═════════════════════════════════════════════════════════════════
+--  ReplicateHouseFromURL.lua  –  réplica exacta (rotación/colores)
+--═════════════════════════════════════════════════════════════════
+
+-------------------------- rutas / pacing --------------------------
+local ROUTE_ENTER_EDIT_MODE = "HousingAPI/EnterEditMode"
+local ROUTE_EXIT_EDIT_MODE  = "HousingAPI/ExitEditMode"
+local ROUTE_SET_TEXTURE     = "HousingAPI/SetRoomTexture"
+local ROUTE_MODIFY_ADDONS   = "HousingAPI/ModifyHouseAddons"
+local ROUTE_BUY_FURNITURES  = "HousingAPI/BuyFurnitures" -- 1 a 1
+
+local WAIT_ENTER_READY = 0.35
+local WAIT_TEXTURE     = 0.06
+local WAIT_PER_FURNI   = 0.10
+local WAIT_CONFIRM     = 0.05
+local MAX_FAILS_BEFORE_ABORT = 20
+
+-------------------------- servicios -------------------------------
+local RS          = game:GetService("ReplicatedStorage")
+local Players     = game:GetService("Players")
+local LP          = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+-------------------------- Fsys / módulos --------------------------
+local Fsys  = require(RS:WaitForChild("Fsys"))
+local load  = Fsys.load
+local Roact = load("Roact")
+local RouterClient = load("RouterClient")
+
+-- ClientStore puede no existir en builds viejas; protegemos:
+local ClientStore  = nil
+pcall(function() ClientStore = load("ClientStore") end)
+local HouseClient  = nil
+pcall(function() HouseClient = load("HouseClient") end)
+
+--═════════════════════════════════ helpers ══════════════════════════════════
+local function remote(route)
+   local ok, r = pcall(function() return RouterClient.get(route) end)
+   if not ok or r == nil then return nil end
+   return r
+end
+
+local function call(r, ...)
+   if not r then return false, "remote nil" end
+   local fn = r.InvokeServer or r.FireServer
+   if not fn then return false, "sin método Invoke/Fire" end
+   return pcall(fn, r, ...)
+end
+
+-- ¿Estamos en modo edición?
+local function is_edit_mode()
+   if ClientStore and ClientStore.store and ClientStore.store.getState then
+      local ok, st = pcall(function() return ClientStore.store:getState() end)
+      if ok and st and (st.house_editor_state == "Edit" or st.is_in_house_edit_mode) then
+         return true
+      end
+   end
+   if HouseClient and HouseClient.is_edit_mode_active then
+      local ok, res = pcall(HouseClient.is_edit_mode_active)
+      if ok and res then return true end
+   end
+   return false
+end
+
+-- Espera a Edit con timeout (no cuelga)
+local function wait_edit_mode(timeout)
+   local t0 = os.clock()
+   while not is_edit_mode() do
+      if timeout and (os.clock() - t0) > timeout then return false end
+      task.wait(0.05)
+   end
+   return true
+end
+
+-- Enter/Exit robustos (sin yields infinitos)
+local function enterEdit(setStatus)
+   -- 1) Si ya estamos, listo
+   if is_edit_mode() then return true end
+
+   -- 2) Si existe el route, lo intentamos SIN WaitForChild
+   local r = remote(ROUTE_ENTER_EDIT_MODE)
+   if r then
+      call(r) -- ignoramos el resultado; algunos servers no devuelven nada
+      task.wait(WAIT_ENTER_READY)
+      if wait_edit_mode(3) then return true end
+   end
+
+   -- 3) Fallback: pedir al usuario que pulse el botón y esperar
+   if setStatus then setStatus("Pulsa *Edit House* (15s)…") end
+   if wait_edit_mode(15) then return true end
+
+   -- 4) Último intento: algunos servers reaccionan a este “log”
+   local rc = remote("HousingAPI/SendHousingOnePointOneLog")
+   if rc and rc.FireServer then
+      pcall(rc.FireServer, rc, "edit_state_entered", {house_type="mine"})
+      if wait_edit_mode(5) then return true end
+   end
+
+   return false
+end
+
+local function exitEdit()
+   local r = remote(ROUTE_EXIT_EDIT_MODE)
+   if r then call(r) end
+end
+
+--======================== reconstrucción desde dump ===========================
+local function colorFromDump(t)
+   if typeof(t)=="Color3" then return t end
+   if type(t)=="table" then
+      if t.__type=="Color3" and t.r and t.g and t.b then
+         return Color3.new(t.r, t.g, t.b)
+      end
+      if t[1] and t[2] and t[3] then
+         return Color3.new(t[1], t[2], t[3])
+      end
+   end
+   return nil
+end
+
+local function parseColors(tbl)
+   if not tbl then return nil end
+   if typeof(tbl)=="Color3" then return {tbl} end
+   if type(tbl)~="table" then return nil end
+   local out = {}
+   for k,v in pairs(tbl) do out[k] = colorFromDump(v) or v end
+   return next(out) and out or nil
+end
+
+local function cfFromDump(cf)
+   if typeof(cf)=="CFrame" then return cf end
+   if type(cf) ~= "table" then return CFrame.new() end
+
+   if cf.__type=="CFrame" and cf.pos and cf.right and cf.up then
+      local p = Vector3.new(cf.pos[1],  cf.pos[2],  cf.pos[3])
+      local r = Vector3.new(cf.right[1],cf.right[2],cf.right[3])
+      local u = Vector3.new(cf.up[1],   cf.up[2],   cf.up[3])
+      return CFrame.fromMatrix(p, r, u)
+   end
+   if cf.__type=="CFrame" and cf.pos and cf.look then
+      local p = Vector3.new(cf.pos[1],  cf.pos[2],  cf.pos[3])
+      local look = Vector3.new(cf.look[1],cf.look[2],cf.look[3]).Unit
+      return CFrame.lookAt(p, p + look)
+   end
+   if cf.__type=="CFrame" and cf.pos and cf.axis and cf.angle then
+      local p = Vector3.new(cf.pos[1],  cf.pos[2],  cf.pos[3])
+      local axis = Vector3.new(cf.axis[1], cf.axis[2], cf.axis[3]).Unit
+      return CFrame.fromAxisAngle(axis, cf.angle) + p
+   end
+   return CFrame.new()
+end
+
+local function parseScale(s)
+   if type(s)=="number" then return s end
+   if typeof(s)=="Vector3" then return s end
+   if type(s)=="table" then
+      if s.__type=="Vector3" and s.x and s.y and s.z then
+         return Vector3.new(s.x,s.y,s.z)
+      end
+      if s[1] and s[2] and s[3] then
+         return Vector3.new(s[1],s[2],s[3])
+      end
+   end
+   return s
+end
+
+------------------------------ HTTP (executor/proxy) ---------------------------
+local proxyRF
+local function getProxy()
+   if proxyRF then return proxyRF end
+   proxyRF = Instance.new("RemoteFunction")
+   proxyRF.Name = "__ReplicateHttpProxy"
+   proxyRF.Parent = RS
+   proxyRF.OnServerInvoke = function(_, url)
+      local ok, res = pcall(HttpService.GetAsync, HttpService, url, false)
+      return ok, ok and res or tostring(res)
+   end
+   return proxyRF
+end
+
+local function httpFetch(url)
+   local req = (syn and syn.request) or (http and http.request) or request
+   if req then
+      local r = req{Url=url, Method="GET"}
+      if r and r.StatusCode == 200 then return r.Body end
+      error(("HTTP %s"):format(r and r.StatusCode or "?"))
+   end
+   if game.HttpGet then
+      local ok, body = pcall(game.HttpGet, game, url)
+      if ok then return body end
+   end
+   local ok, res = getProxy():InvokeServer(url)
+   if ok then return res end
+   error(res)
+end
+
+--══════════════════════ eventos para UI ═══════════════════════════════════════
+local ReplicateEvent = Instance.new("BindableEvent") -- (done,total)
+local StepEvent      = Instance.new("BindableEvent") -- "Textures"/"Add-ons"/"Furniture"
+
+--══════════════════════ rutina principal ══════════════════════════════════════
+local function replicateHouse(dump, setStatus, setProgTotal, onDone)
+   task.spawn(function()
+      local failures, placed = 0, 0
+      local total = dump.furniture_count or #(dump.furniture or {})
+      setProgTotal(total)
+
+      if not enterEdit(setStatus) then
+         setStatus("❌ No se pudo entrar en modo edición.")
+         if onDone then onDone() end
+         return
+      end
+      task.wait(WAIT_ENTER_READY)
+
+      -- Texturas
+      StepEvent:Fire("Textures")
+      local setTexR = remote(ROUTE_SET_TEXTURE)
+      if setTexR and dump.house and dump.house.textures then
+         for roomId, room in pairs(dump.house.textures) do
+            for texType, texId in pairs(room) do
+               call(setTexR, roomId, texType, texId)
+               task.wait(WAIT_TEXTURE)
+            end
+         end
+      end
+
+      -- Add-ons
+      StepEvent:Fire("Add-ons")
+      local modAdd = remote(ROUTE_MODIFY_ADDONS)
+      if modAdd and dump.house and dump.house.active_addons_resolved then
+         call(modAdd, dump.house.house_id or 0, dump.house.active_addons_resolved)
+         task.wait(WAIT_TEXTURE)
+      end
+
+      -- Muebles (uno a uno)
+      StepEvent:Fire("Furniture")
+      local list = dump.furniture or {}
+      local buyR = remote(ROUTE_BUY_FURNITURES)
+
+      for i, entry in ipairs(list) do
+         local f = entry.furniture_data or entry
+         local kind   = f.id or f.kind
+         local cframe = cfFromDump(f.cframe)
+         local scale  = parseScale(f.scale)
+         local colors = parseColors(f.colors)
+         local payload = { { kind = kind, properties = { cframe = cframe, scale = scale, colors = colors } } }
+
+         local ok, res = call(buyR, payload)
+         task.wait(WAIT_CONFIRM)
+         if not ok or not res or (type(res)=="table" and res.success == false) then
+            failures += 1
+            warn(("[Replicate] Falló BuyFurnitures para '%s' (i=%d)"):format(tostring(kind), i))
+            if failures >= MAX_FAILS_BEFORE_ABORT then
+               warn("[Replicate] Demasiados fallos; abortando.")
+               break
+            end
+         else
+            placed += 1
+         end
+
+         ReplicateEvent:Fire(i, total)
+         task.wait(WAIT_PER_FURNI)
+      end
+
+      exitEdit()
+      if failures == 0 then setStatus("✅ Replicación completada")
+      else setStatus(string.format("⚠️ Completado con %d fallo(s)", failures)) end
+      if onDone then onDone() end
+   end)
+end
+
+--════════════════════════════════ UI ══════════════════════════════════════════
+local Ui = Roact.Component:extend("ReplicateUi")
+
+function Ui:init()
+   self.state = {
+      show        = true,
+      url         = "",
+      status      = "Waiting URL…",
+      meta        = nil,
+      prog        = 0,
+      total       = 1,
+      phase       = "",
+      downloading = false,
+      replicating = false,
+   }
+
+   self.repConn = ReplicateEvent.Event:Connect(function(done,total)
+      local d = tonumber(done) or 0
+      local t = tonumber(total) or 1
+      self:setState{
+         prog   = d, total  = t,
+         status = string.format("Replicating %d/%d…", d, t)
+      }
+   end)
+   self.stepConn = StepEvent.Event:Connect(function(phase)
+      self:setState{phase = tostring(phase or "")}
+   end)
+end
+
+function Ui:willUnmount()
+   if self.repConn then self.repConn:Disconnect() end
+   if self.stepConn then self.stepConn:Disconnect() end
+end
+
+function Ui:render()
+   local s = self.state
+   local pct = s.total>0 and s.prog/math.max(1,s.total) or 0
+
+   local metaText
+   if s.meta then
+      local ownerStr = tostring(s.meta.owner or "‑")
+      local typeStr  = tostring(s.meta.building_type or "‑")
+      local furnCnt  = tonumber(s.meta.furniture_count or 0) or 0
+      local timeNum  = tonumber(s.meta.time or 0) or 0
+      local dateStr  = os.date("%c", timeNum)
+      local fmtStr   = tostring(s.meta.format or "-")
+      metaText = string.format("Owner: %s\nType: %s\nFurniture: %d\nDate: %s\nFormat: %s",
+         ownerStr, typeStr, furnCnt, dateStr, fmtStr)
+   else
+      metaText = "No dump loaded."
+   end
+
+   return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+      Toggle = Roact.createElement("TextButton",{
+         Text="☰", Font=Enum.Font.GothamBold, TextSize=22,
+         BackgroundColor3=Color3.fromRGB(50,50,90), TextColor3=Color3.new(1,1,1),
+         Size=UDim2.new(0,36,0,36), Position=UDim2.new(0,10,0,56),
+         [Roact.Event.Activated]=function() self:setState{show=not s.show} end,
+      }),
+
+      Window = Roact.createElement("Frame",{
+         Visible=s.show, Size=UDim2.new(0,460,0,270),
+         Position=UDim2.new(0,60,0,60),
+         BackgroundColor3=Color3.fromRGB(30,30,30), BorderSizePixel=0,
+      },{
+
+         Corner = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+         Title = Roact.createElement("TextLabel",{
+            Text="Replicate House (URL)", Font=Enum.Font.GothamBold, TextSize=22,
+            BackgroundTransparency=1, TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(1,-20,0,28), Position=UDim2.new(0,10,0,8),
+            TextXAlignment=Enum.TextXAlignment.Left,
+         }),
+
+         UrlBox = Roact.createElement("TextBox",{
+            PlaceholderText="https://…/dump_house_*.json",
+            Text=s.url, ClearTextOnFocus=false,
+            Font=Enum.Font.Code, TextSize=14,
+            BackgroundColor3=Color3.fromRGB(45,45,60), TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(1,-20,0,28), Position=UDim2.new(0,10,0,38),
+            [Roact.Change.Text]=function(r) self:setState{url=r.Text} end,
+         },{ Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}) }),
+
+         Status = Roact.createElement("TextLabel",{
+            Text = (s.phase~="" and ("["..s.phase.."] ") or "") .. tostring(s.status or ""),
+            Font=Enum.Font.Gotham, TextSize=14,
+            BackgroundTransparency=1, TextColor3=Color3.fromRGB(200,200,200),
+            Size=UDim2.new(1,-20,0,18), Position=UDim2.new(0,10,0,70),
+            TextXAlignment=Enum.TextXAlignment.Left,
+         }),
+
+         ProgBG = Roact.createElement("Frame",{
+            Size=UDim2.new(1,-20,0,10), Position=UDim2.new(0,10,0,90),
+            BackgroundColor3=Color3.fromRGB(55,55,55), BorderSizePixel=0,
+         },{ Fill = Roact.createElement("Frame",{
+               Size=UDim2.new(pct,0,1,0),
+               BackgroundColor3=Color3.fromRGB(60,120,200), BorderSizePixel=0,
+            })
+         }),
+
+         Info = Roact.createElement("TextLabel",{
+            Text=metaText, Font=Enum.Font.Gotham, TextSize=14,
+            BackgroundColor3=Color3.fromRGB(45,45,45), TextColor3=Color3.new(1,1,1),
+            TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Top,
+            Size=UDim2.new(1,-20,1,-140), Position=UDim2.new(0,10,0,110),
+            BorderSizePixel=0,
+         },{ Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}) }),
+
+         BtnLoad = Roact.createElement("TextButton",{
+            Text=s.downloading and"Loading…" or"Load JSON",
+            Font=Enum.Font.GothamBold, TextSize=18,
+            BackgroundColor3=Color3.fromRGB(80,150,90), TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(0.48,-12,0,36), Position=UDim2.new(0,10,1,-46),
+            AutoButtonColor=not s.downloading,
+            [Roact.Event.Activated]=function()
+               if s.downloading then return end
+               local url = s.url
+               if type(url)~="string" or not url:match("^https?://") then
+                  self:setState{status="❌ Invalid URL."}; return
+               end
+               self:setState{downloading=true,status="Downloading…",prog=0,total=1,phase=""}
+               task.spawn(function()
+                  local ok, body = pcall(httpFetch, url)
+                  if not ok then
+                     self:setState{status="❌ "..tostring(body),downloading=false}; return
+                  end
+                  local ok2, dump = pcall(HttpService.JSONDecode, HttpService, body)
+                  if not ok2 then
+                     self:setState{status="❌ Malformed JSON",downloading=false}; return
+                  end
+                  self.dumpLoaded = dump
+                  local h = dump.house or {}
+                  local fmt = (dump.format and dump.format.cframe) or "?"
+                  self:setState{
+                     downloading=false, status="JSON OK",
+                     meta = {
+                        owner           = h.player or h.owner or "?",
+                        building_type   = h.building_type or "?",
+                        furniture_count = dump.furniture_count or #(dump.furniture or {}),
+                        time            = dump.time,
+                        format          = fmt,
+                     },
+                     prog=0, total=1, phase=""
+                  }
+               end)
+            end,
+         }),
+
+         BtnRep = Roact.createElement("TextButton",{
+            Text=s.replicating and"Replicating…" or"Replicate",
+            Font=Enum.Font.GothamBold, TextSize=18,
+            BackgroundColor3=Color3.fromRGB(60,120,200), TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(0.48,-12,0,36), Position=UDim2.new(0.52,2,1,-46),
+            AutoButtonColor=not s.replicating,
+            [Roact.Event.Activated]=function()
+               if self.dumpLoaded and not s.replicating then
+                  local total = self.dumpLoaded.furniture_count or #(self.dumpLoaded.furniture or {})
+                  self:setState{replicating=true,status="Entering edit mode…",prog=0,total=total,phase=""}
+                  replicateHouse(
+                     self.dumpLoaded,
+                     function(txt) self:setState{status=tostring(txt or "")} end,
+                     function(total2) self:setState{total=tonumber(total2) or total} end,
+                     function()
+                        -- permitir replicar otra vez (botón no se queda colgado)
+                        self:setState{replicating=false,phase=""}
+                     end
+                  )
+               end
+            end,
+         }),
+      }),
+   })
+end
+
+Roact.mount(Roact.createElement(Ui), LP:WaitForChild("PlayerGui"))
