@@ -1,0 +1,160 @@
+-- StarterPlayerScripts/TeleportToDebugInterior.client.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContextActionService = game:GetService("ContextActionService")
+
+local LOCAL_PLAYER = Players.LocalPlayer
+local Fsys = ReplicatedStorage:WaitForChild("Fsys")
+local load = require(Fsys).load
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+-- Requiere un módulo de Fsys reintentando hasta que esté disponible.
+local function safeLoad(name, timeout)
+	timeout = timeout or 20
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.25)
+	end
+	error(("[DebugInterior TP] No pude cargar '%s' dentro del tiempo."):format(name))
+end
+
+-- Espera a que el framework principal esté “caliente”:
+--  1) Que exista PlayerGui (UI montable)
+--  2) Que UIManager e InteractionsEngine carguen sin error
+--  3) Que InteriorsM esté listo para recibir llamadas
+local function waitForFrameworkReady()
+	-- Espera a que el PlayerGui exista (algunos UIs se montan ahí)
+	repeat task.wait() until LOCAL_PLAYER:FindFirstChild("PlayerGui")
+
+	-- Carga estable de módulos base. Si aún no están listos, reintentará.
+	local UIManager          = safeLoad("UIManager", 30)              -- ReplicatedStorage.ClientModules.Core.UIManager.UIManager
+	local InteractionsEngine = safeLoad("InteractionsEngine", 30)     -- ReplicatedStorage.ClientModules.Core.InteractionsEngine.InteractionsEngine
+	local InteriorsM         = safeLoad("InteriorsM", 30)             -- ReplicatedStorage.ClientModules.Core.InteriorsM.InteriorsM
+
+	-- En algunos proyectos UIManager expone métodos/props de “ready”.
+	-- Si no existen, esto no rompe (pcall); simplemente seguimos.
+	pcall(function()
+		if UIManager.await_ready then UIManager:await_ready() end
+		if UIManager.is_ready and not UIManager:is_ready() then
+			repeat task.wait(0.2) until UIManager:is_ready()
+		end
+	end)
+
+	return UIManager, InteractionsEngine, InteriorsM
+end
+
+local function canEnter(InteriorsM, dest)
+	local ok, reason = InteriorsM.can_enter(dest)
+	if not ok then
+		warn(("[DebugInterior TP] Bloqueado: %s"):format(tostring(reason)))
+	end
+	return ok
+end
+
+----------------------------------------------------------------------
+-- Teleport principal con fallbacks
+----------------------------------------------------------------------
+
+local DESTINATION_ID = "DebugInterior"
+
+local busy = false
+local function doTeleport()
+	if busy then return end
+	busy = true
+	print("[DebugInterior TP] Iniciando…")
+
+	local UIManager, InteractionsEngine, InteriorsM = waitForFrameworkReady()
+
+	-- Permite TP aunque cambie el Character (tu juego ya maneja ese caso)
+	if InteriorsM.set_allow_non_character_teleports then
+		InteriorsM.set_allow_non_character_teleports(true)
+	end
+
+	if not canEnter(InteriorsM, DESTINATION_ID) then
+		busy = false
+		return
+	end
+
+	-- Parámetros suaves de transición; ajusta al gusto.
+	local opts = {
+		fade_in_length  = 0.5,
+		fade_out_length = 0.4,
+		move_camera     = true,
+		camera_zoom     = 12,
+		-- spawn_cframe = CFrame.new(x,y,z), -- si quieres forzar un punto exacto dentro
+	}
+
+	-- 1) Intento preferido: enter_smooth
+	local ok1, err1 = pcall(function()
+		InteriorsM.enter_smooth(DESTINATION_ID, nil, opts)
+	end)
+	if ok1 then
+		print("[DebugInterior TP] OK con enter_smooth.")
+		busy = false
+		return
+	end
+	warn("[DebugInterior TP] enter_smooth falló: ", err1)
+
+	-- 2) Fallback: enter (sin transición)
+	local ok2, err2 = pcall(function()
+		InteriorsM.enter(DESTINATION_ID, nil, opts)
+	end)
+	if ok2 then
+		print("[DebugInterior TP] OK con enter (fallback).")
+		busy = false
+		return
+	end
+	warn("[DebugInterior TP] enter falló: ", err2)
+
+	-- 3) Último recurso: pedir al servidor la localización directamente y reintentar
+	local ok3, err3 = pcall(function()
+		local Router = safeLoad("RouterClient", 10)
+		Router.get("LocationAPI/SetLocation"):FireServer(DESTINATION_ID, nil, nil)
+		-- Pequeña espera para que el server procese y el cliente reciba estado
+		task.wait(0.5)
+		-- Reintento corto de enter (por si ahora sí está todo listo)
+		local okRetry = pcall(function()
+			InteriorsM.enter(DESTINATION_ID, nil, opts)
+		end)
+		if not okRetry then
+			warn("[DebugInterior TP] Reintento tras SetLocation no fue necesario/posible; asumo que el server movió la sesión.")
+		end
+	end)
+	if ok3 then
+		print("[DebugInterior TP] Forzado vía SetLocation (último recurso).")
+	else
+		warn("[DebugInterior TP] Fallback SetLocation falló: ", err3)
+	end
+
+	busy = false
+end
+
+----------------------------------------------------------------------
+-- ¿Cómo activarlo?
+--  A) Automático al iniciar (descomenta la línea de abajo)
+--  B) Con tecla F9 (por defecto)
+----------------------------------------------------------------------
+
+-- A) Auto al iniciar tras el primer render
+-- task.defer(doTeleport)
+
+-- B) Tecla F9 para probar de forma segura
+local ACTION = "TP_DEBUG_INTERIOR"
+ContextActionService:BindAction(
+	ACTION,
+	function(_, state)
+		if state == Enum.UserInputState.Begin then
+			doTeleport()
+		end
+	end,
+	false,
+	Enum.KeyCode.F9
+)
+
+print("[DebugInterior TP] Listo. Pulsa F9 para entrar a 'DebugInterior'.")
