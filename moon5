@@ -1,0 +1,448 @@
+-- AutoMinigames – Smart Queue (solo una cola por ciclo, elige la más cercana a empezar, AFK y logs)
+
+------------------ Cliente obligatorio ------------------
+local RunService = game:GetService("RunService")
+if not RunService:IsClient() then
+	warn("[AutoMG] Debe ser un LocalScript (cliente). Abortando.")
+	return
+end
+
+------------------ Servicios ------------------
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local StarterGui         = game:GetService("StarterGui")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualUser        = game:GetService("VirtualUser")
+local LocalPlayer        = Players.LocalPlayer
+if not LocalPlayer then
+	warn("[AutoMG] LocalPlayer nil. Abortando.")
+	return
+end
+
+------------------ Fsys (carga segura) ------------------
+local function safeRequire(moduleObj)
+	local ok, result = pcall(function() return require(moduleObj) end)
+	if ok then return result end
+	return nil
+end
+
+local FsysFolder = ReplicatedStorage:FindFirstChild("Fsys")
+local FSYS = FsysFolder and safeRequire(FsysFolder) or nil
+local FSYS_LOAD = (FSYS and type(FSYS.load) == "function") and FSYS.load or nil
+
+local function safeLoad(name)
+	if not FSYS_LOAD then return nil end
+	local ok, mod = pcall(function() return FSYS_LOAD(name) end)
+	return ok and mod or nil
+end
+
+------------------ Módulos opcionales ------------------
+local LiveOpsTime           = safeLoad("LiveOpsTime")           or { now = function() return os.clock() end }
+local UIManager             = safeLoad("UIManager")
+local ClientToolManager     = safeLoad("ClientToolManager")     or { now = function() return LiveOpsTime.now() end }
+local MinigameClientManager = safeLoad("MinigameClientManager")
+
+------------------ Config ------------------
+local CONFIG = {
+	-- IDs de minijuegos:
+	order = { "joetation", "coconut_bonk" },
+
+	-- Duraciones fallback
+	fallbackLength = { joetation = 90, coconut_bonk = 120 },
+
+	-- Cadencia (autoajuste)
+	actionCadence  = { joetation = 1.25, coconut_bonk = 1.5 },
+	minCadence = 0.6,  maxCadence = 2.5,
+	cadenceStepDown = 0.10, cadenceStepUp = 0.15,
+
+	-- Watchdog
+	stuckTimeout = 15,
+
+	-- Selección de cola / ETA
+	defaultQueueCountdown = 12,          -- cola abierta sin countdown
+	inProgressGrace = 5,                  -- colchón tras terminar
+	inProgressRetryIfUnknown = 30,        -- sin datos: reintento
+
+	-- Movimiento opcional
+	moveAggressive = true, moveRadiusStop = 10,
+
+	-- Anti‑AFK (tu variable "afk")
+	AFK_ENABLED = true,
+
+	-- UI
+	screenLogs  = true, debugPanel = true, maxLogLines = 18,
+}
+
+------------------ Utilidades/UI ------------------
+local function nowText() return os.date("%Y-%m-%d %H:%M:%S") end
+local function fmtTime(s) s=math.max(0,math.floor(s)); return string.format("%02d:%02d", math.floor(s/60), s%60) end
+
+local debugGui, debugTextLabel, infoLine
+local logBuffer = {}
+
+local function ensureDebugGui()
+	if not CONFIG.debugPanel or debugGui then return end
+	local sg = Instance.new("ScreenGui"); sg.Name="AutoMG_Debug"; sg.ResetOnSpawn=false; sg.IgnoreGuiInset=true; sg.DisplayOrder=1000
+	sg.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	local frame = Instance.new("Frame"); frame.Name="Panel"; frame.Position=UDim2.new(0,12,0,12); frame.Size=UDim2.new(0,460,0,320)
+	frame.BackgroundColor3=Color3.fromRGB(20,20,28); frame.BackgroundTransparency=0.15; frame.BorderSizePixel=0; frame.Parent=sg
+	local corner = Instance.new("UICorner"); corner.CornerRadius=UDim.new(0,12); corner.Parent=frame
+	local title = Instance.new("TextLabel"); title.Size=UDim2.new(1,-16,0,28); title.Position=UDim2.new(0,8,0,8)
+	title.BackgroundTransparency=1; title.TextXAlignment=Enum.TextXAlignment.Left; title.Font=Enum.Font.GothamBold; title.TextSize=18
+	title.Text="🤖 AutoMinigames – Smart Queue"; title.TextColor3=Color3.fromRGB(255,255,255); title.Parent=frame
+	local info = Instance.new("TextLabel"); info.Name="Info"; info.Size=UDim2.new(1,-16,0,18); info.Position=UDim2.new(0,8,0,36)
+	info.BackgroundTransparency=1; info.TextXAlignment=Enum.TextXAlignment.Left; info.Font=Enum.Font.Code; info.TextSize=14
+	info.Text="—"; info.TextColor3=Color3.fromRGB(255,240,180); info.Parent=frame; infoLine=info
+	local box = Instance.new("TextLabel"); box.Name="Log"; box.Size=UDim2.new(1,-16,1,-64); box.Position=UDim2.new(0,8,0,58)
+	box.BackgroundTransparency=1; box.TextXAlignment=Enum.TextXAlignment.Left; box.TextYAlignment=Enum.TextYAlignment.Top
+	box.Font=Enum.Font.Code; box.TextSize=15; box.Text=""; box.TextColor3=Color3.fromRGB(220,235,255); box.Parent=frame
+	debugGui, debugTextLabel = sg, box
+end
+
+local function pushLog(line)
+	if not (CONFIG.debugPanel and debugTextLabel) then return end
+	table.insert(logBuffer, line); while #logBuffer > CONFIG.maxLogLines do table.remove(logBuffer,1) end
+	debugTextLabel.Text = table.concat(logBuffer, "\n")
+end
+
+local function notify(text)
+	if UIManager and CONFIG.screenLogs and UIManager.apps and UIManager.apps.HintApp then
+		pcall(function() UIManager.apps.HintApp:hint({text=text; length=2.8; color=Color3.fromRGB(235,255,180); overridable=true}) end)
+	else
+		pcall(function() StarterGui:SetCore("SendNotification", {Title="AutoMG", Text=text, Duration=3}) end)
+	end
+end
+
+local function LOG(tag, icon, msg)
+	local line = string.format("[%s][%s %s] %s", nowText(), tag, icon, msg)
+	print(line); pushLog(line); if CONFIG.screenLogs then notify(icon .. " " .. msg) end
+end
+
+------------------ Helpers MG ------------------
+local function getClient(id)
+	if not MinigameClientManager then return nil end
+	local ok, cli = pcall(function() return MinigameClientManager.get(id) end)
+	return ok and cli or nil
+end
+
+local function getMGLength(cli, id)
+	local len = (CONFIG.fallbackLength and CONFIG.fallbackLength[id]) or 90
+	pcall(function() if cli and cli.minigame_length then len = cli.minigame_length end end)
+	return len
+end
+
+local function hrp() local c=LocalPlayer.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function humanoid() local c=LocalPlayer.Character; return c and c:FindFirstChildWhichIsA("Humanoid") end
+
+-- Lectura de estado
+local function readStatus(cli)
+	local st = { active=false, queueOpen=true, inQueue=false, timeLeft=nil }
+	pcall(function()
+		local s = cli and cli.minigame_state
+		if s ~= nil then
+			if s.is_game_active ~= nil then st.active = s.is_game_active end
+			if s.get_is_game_active then st.active = s:get_is_game_active() end
+			if s.queue_open ~= nil then st.queueOpen = s.queue_open end
+			if s.can_join_queue then st.queueOpen = s:can_join_queue() end
+			if s.queue_state and tostring(s.queue_state):lower()=="closed" then st.queueOpen=false end
+			if s.in_queue ~= nil then st.inQueue = s.in_queue end
+			if s.is_in_queue ~= nil then st.inQueue = s.is_in_queue end
+			if s.isQueued ~= nil then st.inQueue = s.isQueued end
+			if s.time_left then st.timeLeft = tonumber(s.time_left) end
+			if not st.timeLeft and s.seconds_left then st.timeLeft = tonumber(s.seconds_left) end
+			if not st.timeLeft and s.get_time_remaining then st.timeLeft = tonumber(s:get_time_remaining()) end
+		end
+	end)
+	pcall(function()
+		local c = cli and cli.ingame_app_controller
+		if c then
+			if c.is_active ~= nil then st.active = c.is_active end
+			if c.is_in_queue ~= nil then st.inQueue = c.is_in_queue end
+			if c.in_queue ~= nil then st.inQueue = c.in_queue end
+			if not st.timeLeft and c.time_left then st.timeLeft = tonumber(c.time_left) end
+			if not st.timeLeft and c.seconds_left then st.timeLeft = tonumber(c.seconds_left) end
+			if not st.timeLeft and c.get_time_remaining then st.timeLeft = tonumber(c:get_time_remaining()) end
+		end
+	end)
+	if cli and cli.is_participating then st.active = true end
+	return st
+end
+
+-- ETA para poder entrar/empezar
+local function estimateSecondsToStart(cli, id, st)
+	if st.active then
+		local left = st.timeLeft or getMGLength(cli, id) or CONFIG.inProgressRetryIfUnknown
+		return left + CONFIG.inProgressGrace, false
+	end
+	if st.queueOpen == false then
+		return CONFIG.inProgressRetryIfUnknown, false
+	end
+	if st.timeLeft and st.timeLeft > 0 then return st.timeLeft, true end
+	return CONFIG.defaultQueueCountdown, true
+end
+
+------------------ Estado global ------------------
+local lastActivity, lastActionAt, playing, mgEndsAt = {}, {}, {}, {}
+local dynCadence = {}
+for k,v in pairs(CONFIG.actionCadence or {}) do dynCadence[k]=v end
+local actionsCount, windowStart = {}, LiveOpsTime.now()
+local currentGame = nil
+local queuedThisCycle, queuedGameId = false, nil
+local nextGlobalTryAt, nextStatusLogAt = 0, 0
+
+local function updInfoLine()
+	if not infoLine then return end
+	local parts = {}
+	for _, id in ipairs(CONFIG.order) do
+		local apm, elapsed = 0, math.max(1, LiveOpsTime.now() - windowStart)
+		if actionsCount[id] then apm = math.floor(actionsCount[id]*60/elapsed) end
+		table.insert(parts, string.format("%s: APM %d | cad %.2fs %s",
+			id, apm, dynCadence[id] or 0, (playing[id] and "🎮" or "⏸️")))
+	end
+	infoLine.Text = table.concat(parts, "  •  ")
+end
+
+local function markActivity(id) lastActivity[id] = LiveOpsTime.now(); updInfoLine() end
+
+local function canAct(id)
+	local cad = dynCadence[id] or (CONFIG.actionCadence and CONFIG.actionCadence[id]) or 2.0
+	local t = LiveOpsTime.now()
+	if not lastActionAt[id] or (t - lastActionAt[id]) >= cad then lastActionAt[id] = t; return true end
+	return false
+end
+
+local function adjustCadence(id, hadActivity)
+	local cad = dynCadence[id] or (CONFIG.actionCadence and CONFIG.actionCadence[id]) or 2.0
+	if hadActivity then cad = math.max(CONFIG.minCadence, cad - CONFIG.cadenceStepDown)
+	else cad = math.min(CONFIG.maxCadence, cad + CONFIG.cadenceStepUp) end
+	dynCadence[id] = cad; updInfoLine()
+end
+
+------------------ Movimiento opcional ------------------
+local function moveTo(target)
+	if not CONFIG.moveAggressive then return end
+	local hum, root = humanoid(), hrp(); if not (hum and root) then return end
+	if (root.Position - target).Magnitude <= CONFIG.moveRadiusStop then return end
+	local path = PathfindingService:CreatePath()
+	local ok = pcall(function() path:ComputeAsync(root.Position, target) end)
+	if not ok or path.Status ~= Enum.PathStatus.Success then hum:MoveTo(target); return end
+	for _, wp in ipairs(path:GetWaypoints()) do hum:MoveTo(wp.Position) end
+end
+
+------------------ Acciones por minijuego ------------------
+local function act_joetation(cli)
+	if not canAct("joetation") then return end
+	local tBefore = LiveOpsTime.now()
+	local root = hrp(); local pos = root and root.Position or Vector3.new(0,0,0)
+	if cli.pickup_pile_position then moveTo(cli.pickup_pile_position) end
+	local ok1 = pcall(function() return cli:message_server("pickup_holdable_from_pile", pos, (ClientToolManager.now and ClientToolManager.now() or LiveOpsTime.now())) end)
+	local cannonIndex = math.random(1,12)
+	if cli.cannons_world and #cli.cannons_world > 0 then
+		local me, best, bestIdx = pos
+		for i,p in ipairs(cli.cannons_world) do local d=(p-me).Magnitude; if not best or d<best then best, bestIdx=d,i end end
+		if bestIdx then cannonIndex = bestIdx end
+	end
+	local ok2 = pcall(function() return cli:message_server("use_cannon", cannonIndex, pos, (ClientToolManager.now and ClientToolManager.now() or LiveOpsTime.now())) end)
+	actionsCount.joetation = (actionsCount.joetation or 0) + 1
+	LOG("joetation","🎯","Disparo con cañón #"..tostring(cannonIndex))
+	task.delay(0.25, function() adjustCadence("joetation", (LiveOpsTime.now()-tBefore)<2.5 and (ok1 or ok2)) end)
+	markActivity("joetation")
+end
+
+local function act_coconut(cli)
+	if not canAct("coconut_bonk") then return end
+	local tBefore = LiveOpsTime.now()
+	pcall(function() cli:message_server("pickup_droppable", 1) end)
+	local root = hrp(); local me = root and root.Position or Vector3.new(0,0,0)
+	local bestUid, bestScore = nil, -1
+	if cli.ships_by_uid then
+		for uid, ship in pairs(cli.ships_by_uid) do
+			local hp, p = 1, nil
+			pcall(function()
+				if ship.ship_data and ship.ship_data.health then hp = ship.ship_data.health end
+				if ship.base and ship.base.PrimaryPart then p = ship.base.PrimaryPart.Position end
+			end)
+			local dist = p and (p - me).Magnitude or 1000
+			local score = hp - dist*0.02
+			if score > bestScore then bestScore, bestUid = score, uid end
+		end
+	end
+	if bestUid then
+		local ok = pcall(function() return cli:message_server("used_droppable", bestUid) end)
+		actionsCount.coconut_bonk = (actionsCount.coconut_bonk or 0) + 1
+		LOG("coconut_bonk","🥥","Lanzado al barco "..tostring(bestUid))
+		task.delay(0.25, function() adjustCadence("coconut_bonk", (LiveOpsTime.now()-tBefore)<2.5 and ok) end)
+		markActivity("coconut_bonk")
+	end
+end
+
+------------------ Recompensas ------------------
+local rewardRoutes = { "claim_rewards","collect_rewards","request_rewards","request_reward_payout","claim_payout","claim_xp" }
+local function tryClaimRewards(id, cli)
+	for _, route in ipairs(rewardRoutes) do
+		local ok = pcall(function() return cli:message_server(route) end)
+		if ok then LOG(id,"🏆","Recompensas ("..route..")"); return end
+	end
+	if cli.ingame_app_controller then
+		for _, m in ipairs({"claimRewards","ClaimRewards","Finish","finish","Complete","complete"}) do
+			local f = cli.ingame_app_controller[m]
+			if typeof(f)=="function" then if pcall(function() f(cli.ingame_app_controller) end) then LOG(id,"🏆","Recompensas via controller ("..m..")"); return end end
+		end
+	end
+end
+
+------------------ Selección de cola ------------------
+local function pickBestQueue()
+	local bestId, bestEta, bestJoinable, bestSt = nil, math.huge, false, nil
+	for _, id in ipairs(CONFIG.order) do
+		local cli = getClient(id)
+		if cli then
+			local st = readStatus(cli)
+			local eta, joinable = estimateSecondsToStart(cli, id, st)
+			if eta < bestEta then bestId, bestEta, bestJoinable, bestSt = id, eta, joinable, st end
+		end
+	end
+	return bestId, bestEta, bestJoinable, bestSt
+end
+
+local function attemptJoin(id, st)
+	local cli = getClient(id); if not cli then return false end
+	if st.inQueue then
+		LOG(id,"✅","Ya en cola. Esperando comienzo."); return true
+	end
+	if st.active or st.queueOpen == false then return false end
+	local okJoin = false
+	if cli.join_persistent_game then okJoin = pcall(function() cli:join_persistent_game() end) end
+	if (not okJoin) and cli.message_server then okJoin = pcall(function() cli:message_server("join_queue") end) end
+	if okJoin then LOG(id,"🕒","Entré a la cola (una sola vez en este ciclo).") end
+	return okJoin
+end
+
+------------------ Lifecycle ------------------
+local function onGameStarted(id, cli)
+	local len = getMGLength(cli, id)
+	playing[id], currentGame = true, id
+	mgEndsAt[id] = LiveOpsTime.now() + len
+	actionsCount[id], windowStart = 0, LiveOpsTime.now()
+	queuedThisCycle, queuedGameId = true, id
+	LOG(id,"🚀","¡Partida iniciada! ⏱️ "..fmtTime(len).." restantes.")
+end
+
+local function onGameEnded(id, cli)
+	playing[id] = false; if currentGame == id then currentGame = nil end; mgEndsAt[id] = nil
+	LOG(id,"🏁","Fin de partida. Reclamando recompensas…")
+	tryClaimRewards(id, cli)
+	queuedThisCycle, queuedGameId = false, nil
+	LOG(id,"🔁","Reiniciando ciclo: elegiré la cola más cercana a empezar.")
+end
+
+local function wireSignals(id, cli)
+	if cli and cli.minigame_state and cli.minigame_state.get_property_changed_signal then
+		pcall(function()
+			cli.minigame_state:get_property_changed_signal("is_game_active"):Connect(function(isActive)
+				if isActive then onGameStarted(id, cli) else onGameEnded(id, cli) end
+			end)
+		end)
+	end
+	pcall(function() local s = cli and cli.game_end_signal; if s and s.Connect then s:Connect(function() onGameEnded(id, cli) end) end end)
+end
+
+------------------ Anti‑AFK ------------------
+local AFK = { enabled = CONFIG.AFK_ENABLED, connections = {}, lastWiggle = 0 }
+local function enableAntiAFK()
+	if not AFK.enabled or #AFK.connections > 0 then return end
+	LOG("afk","🛡️","Anti‑AFK ACTIVADO.")
+	table.insert(AFK.connections, LocalPlayer.Idled:Connect(function()
+		VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new(0,0))
+		LOG("afk","🖱️","Ping anti‑idle.")
+	end))
+	table.insert(AFK.connections, RunService.Heartbeat:Connect(function()
+		local t = LiveOpsTime.now()
+		if t - AFK.lastWiggle > 30 then
+			local r = hrp(); if r then r.CFrame = r.CFrame * CFrame.Angles(0, math.rad(1), 0) end
+			AFK.lastWiggle = t; LOG("afk","🎮","Wiggle sutil.")
+		end
+	end))
+end
+local function disableAntiAFK()
+	for _, c in ipairs(AFK.connections) do pcall(function() c:Disconnect() end) end
+	AFK.connections = {}; LOG("afk","🛑","Anti‑AFK DESACTIVADO.")
+end
+
+------------------ Arranque ------------------
+ensureDebugGui()
+if AFK.enabled then enableAntiAFK() end
+LOG("init","✨","AutoMinigames – Smart Queue iniciado.")
+LOG("init","🎯","Regla: entrar UNA vez por ciclo a la cola con MENOR tiempo para iniciar.")
+
+task.defer(function() for _, id in ipairs(CONFIG.order) do local cli = getClient(id); if cli then wireSignals(id, cli) end end end)
+
+task.spawn(function()
+	while true do
+		-- Si no jugamos y no hemos hecho solicitud en este ciclo…
+		if not currentGame and not queuedThisCycle then
+			local now = LiveOpsTime.now()
+			local id, eta, joinable, st = pickBestQueue()
+			if id then
+				if joinable then
+					if attemptJoin(id, st) or st.inQueue then
+						queuedThisCycle, queuedGameId = true, id
+					else
+						-- pequeño backoff (no spamear)
+						task.wait(math.max(2, math.min(eta or 5, 10)))
+					end
+				else
+					-- esperar a que ese juego quede disponible
+					local waitFor = math.max(2, eta or CONFIG.inProgressRetryIfUnknown)
+					if now % 5 < 0.3 then LOG(id,"⏳","Esperando disponibilidad (~"..fmtTime(waitFor)..").") end
+					task.wait(waitFor)
+				end
+			else
+				task.wait(2)
+			end
+		else
+			task.wait(0.1)
+		end
+
+		-- Acciones del juego activo / watchdog / countdown
+		for _, id in ipairs(CONFIG.order) do
+			local cli = getClient(id)
+			local last = lastActivity[id]
+			if last and (LiveOpsTime.now() - last) > CONFIG.stuckTimeout then
+				LOG(id,"🔄","Watchdog: sin actividad.")
+				lastActivity[id] = LiveOpsTime.now()
+			end
+			if cli and cli.is_participating then
+				if currentGame ~= id or not playing[id] then onGameStarted(id, cli) end
+				if id == "joetation" then act_joetation(cli)
+				elseif id == "coconut_bonk" then act_coconut(cli)
+				else pcall(function() cli:message_server("heartbeat") end); LOG(id,"🎮","Ping genérico.") end
+				markActivity(id)
+			end
+			local eta = mgEndsAt[id]
+			if eta then
+				local rem = math.max(0, math.floor(eta - LiveOpsTime.now()))
+				if rem % 5 == 0 then LOG(id,"⏳","Tiempo restante: "..fmtTime(rem)) end
+				if rem == 0 and cli and cli.is_participating then tryClaimRewards(id, cli); mgEndsAt[id] = nil end
+			end
+		end
+	end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+	LOG("player","🧍","Character listo; reanudando.")
+	for _, id in ipairs(CONFIG.order) do lastActivity[id] = LiveOpsTime.now() end
+end)
+
+-- Atajos por chat
+pcall(function()
+	LocalPlayer.Chatted:Connect(function(msg)
+		if msg == "!automg panel" and debugGui then
+			debugGui.Enabled = not debugGui.Enabled; LOG("ui","🖥️","Panel "..(debugGui.Enabled and "activado" or "oculto")..".")
+		elseif msg == "!automg afk on" then AFK.enabled = true; enableAntiAFK()
+		elseif msg == "!automg afk off" then AFK.enabled = false; disableAntiAFK()
+		elseif msg == "!automg move on" then CONFIG.moveAggressive = true;  LOG("ui","🧭","Reposicionamiento ON")
+		elseif msg == "!automg move off" then CONFIG.moveAggressive = false; LOG("ui","🧭","Reposicionamiento OFF")
+		end
+	end)
+end)
