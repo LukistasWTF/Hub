@@ -1,0 +1,114 @@
+-- LocalScript (cliente) — NO crea módulos, NO toca tus códigos finales.
+-- Intenta usar tus módulos "Downloads" e "InteriorsM" vía Fsys.load.
+-- Si el require falla (el error del screenshot), cae a los remotos API originales.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local API = ReplicatedStorage:WaitForChild("API")
+
+-- === Parámetros exactos que pediste ===
+local FOLDER = "Interiors"
+local ITEM   = "Cave"
+local DEST   = "Cave"
+
+-- Esperar al character para evitar tp en nil
+local lp = Players.LocalPlayer
+if not lp.Character then lp.CharacterAdded:Wait() end
+
+-- ---------- helpers ----------
+local function safeRequireFsysLoad()
+	-- Requerir Fsys.load desde LocalScript puede dar:
+	-- "Cannot require a non-RobloxScript module from a RobloxScript".
+	-- Lo envolvemos en pcall para que no rompa el hilo.
+	local ok, loadOrErr = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Fsys")).load
+	end)
+	if ok and typeof(loadOrErr) == "function" then
+		return loadOrErr
+	end
+	return nil
+end
+
+local function download_via_remote(folder, item, params)
+	local remote = API:FindFirstChild("DownloadsAPI/Download")
+	if not remote then return false end
+
+	local tries = 0
+	while tries < 5 do
+		tries += 1
+		local ok, res = pcall(function()
+			return remote:InvokeServer(folder, item, params)
+		end)
+		if not ok then
+			warn("[DownloadsAPI] Invoke error:", res)
+			break
+		end
+		if res and res.download_model_id then
+			-- El cliente oficial usa StreamingHelper.await; aquí no lo tenemos,
+			-- pero el servidor nos confirmó la tarea, así que seguimos.
+			return true
+		end
+		if res and res.status == "RATE_LIMITED" then
+			task.wait(1)
+		else
+			break
+		end
+	end
+	return false
+end
+
+local function setlocation_via_remote(destination)
+	local r = API:FindFirstChild("LocationAPI/SetLocation")
+	if r then
+		pcall(function()
+			r:FireServer(destination)
+		end)
+	else
+		warn("[LocationAPI] SetLocation no encontrado en API.")
+	end
+end
+
+-- ---------- flujo principal ----------
+local load = safeRequireFsysLoad()
+local usedModules = false
+
+if load then
+	-- Intentar usar TUS módulos EXACTOS
+	local Downloads
+	local InteriorsM
+
+	pcall(function() Downloads = load("Downloads") end)
+	pcall(function() InteriorsM = load("InteriorsM") end)
+
+	if Downloads and InteriorsM then
+		usedModules = true
+		-- Descarga con tu módulo (caché, rate limit, etc.)
+		local ok = pcall(function()
+			Downloads.download(FOLDER, ITEM)
+		end)
+		if not ok then
+			warn("[Downloads] fallo; usaré fallback remotos.")
+			usedModules = false
+		else
+			-- Teleport usando tu InteriorsM
+			local options = {
+				anchor_char_immediately = true,
+				-- camera_zoom = 12, -- si lo quieres
+			}
+			pcall(function()
+				InteriorsM.enter_smooth(DEST, nil, options)
+			end)
+		end
+	end
+end
+
+-- Fallback limpio si no pudimos usar los módulos (por la restricción del LocalScript)
+if not usedModules then
+	-- 1) Descargar por remoto con reintentos suaves (respeta RATE_LIMITED)
+	local ok = download_via_remote(FOLDER, ITEM, nil)
+	if not ok then
+		warn("[Fallback] Descarga por remoto no confirmada; continuo de todas formas.")
+	end
+	-- 2) Teleport por remoto
+	setlocation_via_remote(DEST)
+end
