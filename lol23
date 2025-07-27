@@ -1,0 +1,313 @@
+-- LocalScript (StarterPlayerScripts)
+-- Descarga usando TU módulo pegado (sin load("Downloads"))
+-- Entra al interior usando TU InteriorsM (sin tocar su lógica)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local load = require(ReplicatedStorage:WaitForChild("Fsys")).load
+
+-----------------------------------------------------------------------
+-- === TU MÓDULO DE DESCARGAS PEGADO TAL CUAL (SIN load("Downloads")) ==
+-----------------------------------------------------------------------
+local function BuildDownloads()
+	-- Decompiler will be improved VERY SOON!
+	-- Decompiled with Konstant V2.1, a fast Luau decompiler made in Luau by plusgiant5 (https://discord.gg/brNTY8nX8t)
+	-- Decompiled on 2025-07-27 11:30:06
+	-- Luau version 6, Types version 3
+	-- Time taken: 0.005002 seconds
+
+	local load = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+	local any_create_log_result1_upvr = load("Debug").create_log()
+	local var1_result1_upvr_2 = load("RouterClient")
+	local var1_result1_upvr = load("package:Promise")
+	local module_upvr = {}
+	local tbl_5_upvr = {}
+	local tbl_3_upvr = {}
+	local tbl_4_upvr = {}
+	local any_new_result1_upvr = load("Signal").new()
+	local function recursive_instance_count_upvr(arg1) -- Line 21, Named "recursive_instance_count"
+		--[[ Upvalues[1]:
+			[1]: recursive_instance_count_upvr (readonly)
+		]]
+		local var14 = 1
+		for _, v in pairs(arg1:GetChildren()) do
+			var14 += recursive_instance_count_upvr(v)
+		end
+		return var14
+	end
+	local function _(arg1) -- Line 30, Named "serialize_params"
+		if arg1 == nil then
+			return ""
+		end
+		assert(arg1.params_deduplication_hash, "params requires a params_deduplication_hash so diffing can be done.")
+		return arg1.params_deduplication_hash
+	end
+	local var1_result1_upvr_3 = load("new:StreamingHelper")
+	local function download_with_retry_upvr(...) -- Line 40, Named "download_with_retry"
+		--[[ Upvalues[3]:
+			[1]: var1_result1_upvr_2 (readonly)
+			[2]: var1_result1_upvr_3 (readonly)
+			[3]: any_create_log_result1_upvr (readonly)
+		]]
+		while true do
+			local any_InvokeServer_result1 = var1_result1_upvr_2.get("DownloadsAPI/Download"):InvokeServer(...)
+			if any_InvokeServer_result1.download_model_id then
+				any_InvokeServer_result1.download_model = var1_result1_upvr_3.await(any_InvokeServer_result1.download_model_id)
+				return any_InvokeServer_result1
+			end
+			if any_InvokeServer_result1.status == "RATE_LIMITED" then
+				any_create_log_result1_upvr("Client's download was rate limited with parameters", ...)
+				task.wait(1)
+			else
+				local var20, var21 = ...
+				error(`Download failed for {var20}/{var21}. DownloadsAPI/Download response.status: {any_InvokeServer_result1.status}`)
+			end
+		end
+	end
+	function module_upvr.is_cached(arg1, arg2, arg3) -- Line 57
+		--[[ Upvalues[1]:
+			[1]: tbl_3_upvr (readonly)
+		]]
+		local var22
+		if arg3 == nil then
+			var22 = ""
+		else
+			assert(arg3.params_deduplication_hash, "params requires a params_deduplication_hash so diffing can be done.")
+			var22 = arg3.params_deduplication_hash
+		end
+		return not not tbl_3_upvr[(arg1 or "folder")..'/'..(arg2 or "subfolder")..'/'..var22]
+	end
+	function module_upvr.get_downloaded_signal() -- Line 62
+		--[[ Upvalues[1]:
+			[1]: any_new_result1_upvr (readonly)
+		]]
+		return any_new_result1_upvr
+	end
+	local tbl_upvr = {}
+	function module_upvr.download(arg1, arg2, arg3) -- Line 70
+		--[[ Upvalues[7]:
+			[1]: any_create_log_result1_upvr (readonly)
+			[2]: tbl_upvr (readonly)
+			[3]: tbl_4_upvr (readonly)
+			[4]: tbl_3_upvr (readonly)
+			[5]: any_new_result1_upvr (readonly)
+			[6]: download_with_retry_upvr (readonly)
+			[7]: tbl_5_upvr (readonly)
+		]]
+		local var24
+		if arg3 == nil then
+			var24 = ""
+		else
+			assert(arg3.params_deduplication_hash, "params requires a params_deduplication_hash so diffing can be done.")
+			var24 = arg3.params_deduplication_hash
+		end
+		local var25 = (arg1 or "folder")..'/'..(arg2 or "subfolder")..'/'..var24
+		var24 = ')'
+		any_create_log_result1_upvr("Download begin ("..var25..var24)
+		if tbl_upvr[var25] then
+			var24 = ")."
+			any_create_log_result1_upvr("Waiting for previously started download to finish ("..var25..var24)
+		end
+		while tbl_upvr[var25] do
+			task.wait(0.1)
+		end
+		tbl_4_upvr[var25] = false
+		if tbl_3_upvr[var25] then
+			var24 = ')'
+			any_create_log_result1_upvr("Returning cached download ("..var25..var24)
+			var24 = arg2
+			any_new_result1_upvr:Fire(0, arg1, var24, arg3)
+			return tbl_3_upvr[var25]
+		end
+		tbl_upvr[var25] = true
+		var24 = arg3
+		local download_with_retry_result1 = download_with_retry_upvr(arg1, arg2, var24)
+		any_new_result1_upvr:Fire(os.clock() - os.clock(), arg1, arg2, arg3)
+		local download_model = download_with_retry_result1.download_model
+		var24 = download_with_retry_result1.received_remote_event
+		local clone = download_model:Clone()
+		download_model:Destroy()
+		tbl_5_upvr[var25] = tick()
+		tbl_3_upvr[var25] = clone
+		var24:FireServer()
+		tbl_upvr[var25] = nil
+		return clone
+	end
+	function module_upvr.release(arg1, arg2, arg3) -- Line 115
+		--[[ Upvalues[4]:
+			[1]: tbl_3_upvr (readonly)
+			[2]: tbl_5_upvr (readonly)
+			[3]: any_create_log_result1_upvr (readonly)
+			[4]: tbl_4_upvr (readonly)
+		]]
+		local var29
+		if arg3 == nil then
+			var29 = ""
+		else
+			assert(arg3.params_deduplication_hash, "params requires a params_deduplication_hash so diffing can be done.")
+			var29 = arg3.params_deduplication_hash
+		end
+		local var30_upvr = (arg1 or "folder")..'/'..(arg2 or "subfolder")..'/'..var29
+		if tbl_3_upvr[var30_upvr] then
+			local var31 = tick() - tbl_5_upvr[var30_upvr]
+			if 20 <= var31 then
+				var29 = arg2
+				any_create_log_result1_upvr("Releasing download", arg1, var29)
+				tbl_3_upvr[var30_upvr]:Destroy()
+				tbl_3_upvr[var30_upvr] = nil
+				return
+			end
+			var29 = "seconds"
+			any_create_log_result1_upvr("Delaying download release by", 20 - var31, var29)
+			tbl_3_upvr[var30_upvr].Parent = nil
+			tbl_4_upvr[var30_upvr] = true
+			delay(20 - var31, function() -- Line 128
+				--[[ Upvalues[6]:
+					[1]: tbl_4_upvr (copied, readonly)
+					[2]: var30_upvr (readonly)
+					[3]: tbl_3_upvr (copied, readonly)
+					[4]: any_create_log_result1_upvr (copied, readonly)
+					[5]: arg1 (readonly)
+					[6]: arg2 (readonly)
+				]]
+				if tbl_4_upvr[var30_upvr] == true and tbl_3_upvr[var30_upvr] then
+					any_create_log_result1_upvr("Releasing download via delay", arg1, arg2)
+					tbl_3_upvr[var30_upvr]:Destroy()
+					tbl_3_upvr[var30_upvr] = nil
+				end
+			end)
+		end
+	end
+	function module_upvr.promise_download_copy(arg1, arg2, arg3) -- Line 141
+		--[[ Upvalues[2]:
+			[1]: var1_result1_upvr (readonly)
+			[2]: module_upvr (readonly)
+		]]
+		local any_try_result1_upvr = var1_result1_upvr.try(function() -- Line 142
+			--[[ Upvalues[4]:
+				[1]: module_upvr (copied, readonly)
+				[2]: arg1 (readonly)
+				[3]: arg2 (readonly)
+				[4]: arg3 (readonly)
+			]]
+			return module_upvr.download(arg1, arg2, arg3):Clone()
+		end)
+		var1_result1_upvr.try(function() -- Line 147
+			--[[ Upvalues[5]:
+				[1]: any_try_result1_upvr (readonly)
+				[2]: module_upvr (copied, readonly)
+				[3]: arg1 (readonly)
+				[4]: arg2 (readonly)
+				[5]: arg3 (readonly)
+			]]
+			any_try_result1_upvr:await()
+			module_upvr.release(arg1, arg2, arg3)
+		end)
+		return any_try_result1_upvr
+	end
+	function module_upvr.promise_download_copy_many(arg1) -- Line 155
+		--[[ Upvalues[2]:
+			[1]: module_upvr (readonly)
+			[2]: var1_result1_upvr (readonly)
+		]]
+		local tbl_2_upvr = {}
+		for i_2, v_2 in pairs(arg1) do
+			tbl_2_upvr[i_2] = module_upvr.promise_download_copy(v_2[1], v_2[2])
+		end
+		return var1_result1_upvr.new(function(arg1_2, arg2, arg3) -- Line 161
+			--[[ Upvalues[2]:
+				[1]: tbl_2_upvr (readonly)
+				[2]: var1_result1_upvr (copied, readonly)
+			]]
+			arg3(function() -- Line 162
+				--[[ Upvalues[1]:
+					[1]: tbl_2_upvr (copied, readonly)
+				]]
+				for _, v_3 in pairs(tbl_2_upvr) do
+					v_3:cancel()
+				end
+			end)
+			local tbl = {}
+			for i_4, v_4 in pairs(tbl_2_upvr) do
+				local any_awaitStatus_result1, any_awaitStatus_result2 = v_4:awaitStatus()
+				if any_awaitStatus_result1 == var1_result1_upvr.Status.Rejected then
+					arg2(any_awaitStatus_result2)
+					return
+				end
+				if any_awaitStatus_result1 == var1_result1_upvr.Status.Cancelled then return end
+				tbl[i_4] = any_awaitStatus_result2
+			end
+			arg1_2(tbl)
+		end)
+	end
+	function module_upvr.promise_download_display_data_for_item(arg1) -- Line 186
+		--[[ Upvalues[2]:
+			[1]: var1_result1_upvr (readonly)
+			[2]: var1_result1_upvr_2 (readonly)
+		]]
+		return var1_result1_upvr.try(function() -- Line 187
+			--[[ Upvalues[2]:
+				[1]: var1_result1_upvr_2 (copied, readonly)
+				[2]: arg1 (readonly)
+			]]
+			local any_InvokeServer_result1_2 = var1_result1_upvr_2.get("DownloadsAPI/GetDisplayModelInfoForItem"):InvokeServer({
+				owner_player = arg1.owner_player;
+				display_type = arg1.display_type;
+				item_unique = arg1.item_unique;
+			})
+			if any_InvokeServer_result1_2.status == "SUCCESS" then
+				return any_InvokeServer_result1_2.item_info
+			end
+			return nil
+		end)
+	end
+	return module_upvr
+end
+
+local Downloads = BuildDownloads()
+-----------------------------------------------------------------------
+-- ===================== FIN MÓDULO DE DESCARGAS ======================
+-----------------------------------------------------------------------
+
+-- Tu InteriorsM (se usa tal cual lo tienes en Fsys)
+local Interiors = load("InteriorsM")
+
+-- Parámetros que pediste
+local FOLDER = "Interiors"
+local ITEM   = "Cave"
+local DESTINATION_ID = "Cave"
+
+-- (opcional) escuchar evento de descarga
+pcall(function()
+	Downloads.get_downloaded_signal():Connect(function(elapsed, folder, item)
+		print(("[Downloads] %s/%s listo (%.2fs)"):format(folder or "", item or "", tonumber(elapsed) or 0))
+	end)
+end)
+
+-- Asegurar Character
+local lp = Players.LocalPlayer
+if not lp.Character then lp.CharacterAdded:Wait() end
+
+-- 1) Descarga usando TU código pegado
+local ok, result = pcall(function()
+	return Downloads.download(FOLDER, ITEM)
+end)
+if not ok then
+	warn("[Downloads] Error al descargar ", FOLDER, "/", ITEM, ": ", result)
+	return
+end
+
+-- 2) Entrar al interior usando TU InteriorsM (sin llamar remotos directos manualmente)
+local options = {
+	anchor_char_immediately = true,
+	-- Puedes añadir spawn_cframe/camera_cframe/camera_zoom si quieres
+}
+Interiors.enter_smooth(DESTINATION_ID, nil, options)
+
+-- 3) (opcional) liberar caché después del TTL
+task.delay(25, function()
+	pcall(function()
+		Downloads.release(FOLDER, ITEM)
+	end)
+end)
