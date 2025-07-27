@@ -1,0 +1,157 @@
+-- SharedModules/ContentPacks/<Pack>/Downloads
+-- Implementa las funciones que ContentPackHelper espera, sin requerir nada "raro".
+
+local load = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+local DebugLog         = load("Debug").create_log()
+local RouterClient     = load("RouterClient")
+local Promise          = load("package:Promise")
+local Signal           = load("Signal")
+local StreamingHelper  = load("new:StreamingHelper")
+
+local Downloads = {}
+local _busy      = {}   -- clave: "<folder>/<item>/<hash>" -> true mientras descarga
+local _cache     = {}   -- clave -> Instance (modelo clonado)
+local _cacheTime = {}   -- clave -> tick()
+local _delayed   = {}   -- clave -> bool (marcado para liberar en diferido)
+local _downloadedSignal = Signal.new()
+
+-- Utilidad
+local function key(folder, item, params)
+    local h = ""
+    if params ~= nil then
+        assert(params.params_deduplication_hash, "params requiere params_deduplication_hash")
+        h = params.params_deduplication_hash
+    end
+    return (folder or "folder").."/"..(item or "subfolder").."/"..h
+end
+
+-- Señal pública (tiempos, etc.)
+function Downloads.get_downloaded_signal()
+    return _downloadedSignal
+end
+
+function Downloads.is_cached(folder, item, params)
+    return _cache[key(folder, item, params)] ~= nil
+end
+
+-- Descarga robusta vía RouterClient + StreamingHelper (NADA de require a “Downloads” externos)
+local function download_with_retry(folder, item, params)
+    while true do
+        local resp = RouterClient.get("DownloadsAPI/Download"):InvokeServer(folder, item, params)
+        if resp.download_model_id then
+            -- Espera a que el servidor publique el modelo
+            if StreamingHelper then
+                pcall(function() StreamingHelper.await(resp.download_model_id) end)
+            end
+            return resp
+        end
+        if resp.status == "RATE_LIMITED" then
+            DebugLog("Rate limited en descarga; reintentando…", folder, item)
+            task.wait(1)
+        else
+            error(string.format("Download falló para %s/%s (status=%s)", tostring(folder), tostring(item), tostring(resp.status)))
+        end
+    end
+end
+
+function Downloads.download(folder, item, params)
+    local k = key(folder, item, params)
+    DebugLog("Download begin ("..k..")")
+    while _busy[k] do task.wait(0.1) end
+
+    _delayed[k] = false
+
+    if _cache[k] then
+        DebugLog("Returning cached download ("..k..")")
+        _downloadedSignal:Fire(0, folder, item, params)
+        return _cache[k]
+    end
+
+    _busy[k] = true
+    local t0 = os.clock()
+    local resp = download_with_retry(folder, item, params)
+    local m = resp.download_model
+    local clone = m:Clone()
+    m:Destroy()
+
+    _cache[k] = clone
+    _cacheTime[k] = tick()
+
+    if resp.received_remote_event then
+        pcall(function() resp.received_remote_event:FireServer() end)
+    end
+
+    _busy[k] = nil
+    _downloadedSignal:Fire(os.clock() - t0, folder, item, params)
+    return clone
+end
+
+function Downloads.release(folder, item, params)
+    local k = key(folder, item, params)
+    local inst = _cache[k]
+    if not inst then return end
+
+    local alive = tick() - (_cacheTime[k] or 0)
+    if alive >= 20 then
+        DebugLog("Releasing download", folder, item)
+        inst:Destroy()
+        _cache[k] = nil
+        return
+    end
+
+    DebugLog("Delaying download release by", 20 - alive, "seconds")
+    inst.Parent = nil
+    _delayed[k] = true
+    delay(20 - alive, function()
+        if _delayed[k] == true and _cache[k] then
+            DebugLog("Releasing download via delay", folder, item)
+            _cache[k]:Destroy()
+            _cache[k] = nil
+        end
+    end)
+end
+
+function Downloads.promise_download_copy(folder, item, params)
+    local p = Promise.try(function()
+        return Downloads.download(folder, item, params):Clone()
+    end)
+    Promise.try(function()
+        p:await()
+        Downloads.release(folder, item, params)
+    end)
+    return p
+end
+
+function Downloads.promise_download_copy_many(list)
+    local map = {}
+    for i, v in pairs(list) do
+        map[i] = Downloads.promise_download_copy(v[1], v[2], v[3])
+    end
+    return Promise.new(function(resolve, reject, onCancel)
+        onCancel(function()
+            for _, pv in pairs(map) do pv:cancel() end
+        end)
+        local out = {}
+        for i, pv in pairs(map) do
+            local st, val = pv:awaitStatus()
+            if st == Promise.Status.Rejected then reject(val); return end
+            if st == Promise.Status.Cancelled then return end
+            out[i] = val
+        end
+        resolve(out)
+    end)
+end
+
+function Downloads.promise_download_display_data_for_item(args)
+    return Promise.try(function()
+        local r = RouterClient.get("DownloadsAPI/GetDisplayModelInfoForItem"):InvokeServer({
+            owner_player = args.owner_player;
+            display_type = args.display_type;
+            item_unique  = args.item_unique;
+        })
+        if r.status == "SUCCESS" then return r.item_info end
+        return nil
+    end)
+end
+
+return Downloads
