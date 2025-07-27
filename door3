@@ -1,0 +1,154 @@
+--[[
+    TP por puertas a DebugInterior (insta)
+    Colocar como LocalScript en StarterPlayerScripts.
+--]]
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- ==== CONFIGURABLES ====
+local DEST_ID  = "DebugInterior"   -- interior al que quieres ir
+local DOOR_NAME = "MainDoor"       -- nombre de la puerta dentro de Doors
+local WAIT_DOWNLOAD = 12           -- segundos máximos para que aparezca el interior
+-- =======================
+
+-- Carga segura de módulos Fsys
+local load = require(RS:WaitForChild("Fsys")).load
+local function tryLoad(name)
+    local ok, mod = pcall(function() return load(name) end)
+    if ok then return mod end
+    return nil
+end
+
+-- Módulos principales
+local RouterClient       = tryLoad("RouterClient")
+local ContentPackHelper  = tryLoad("ContentPackHelper") -- normalmente quien monta los packs
+local Downloads          = tryLoad("Downloads")         -- gestor de descargas (el que pasaste)
+local DoorsM             = tryLoad("DoorsM")
+local InteriorsM         = tryLoad("InteriorsM")
+
+-- Espera a que el personaje exista
+local function awaitChar()
+    while not LocalPlayer.Character do
+        LocalPlayer:GetPropertyChangedSignal("Character"):Wait()
+    end
+    return LocalPlayer.Character
+end
+
+-- Descarga/render del interior si hace falta
+local function ensureInterior(folderName, itemName)
+    -- 1) Si ya está en workspace, listo
+    local interiorsFolder = workspace:FindFirstChild("Interiors")
+    if interiorsFolder and interiorsFolder:FindFirstChild(itemName) then return true end
+
+    -- 2) Intenta vía ContentPackHelper (si existe)
+    if ContentPackHelper and ContentPackHelper.ensure then
+        pcall(function()
+            -- algunos ContentPackHelper tienen ensure(folder, name) o ensure_one/ensure_downloaded
+            ContentPackHelper.ensure(folderName, itemName)
+        end)
+    end
+
+    -- 3) Intenta vía Downloads (módulo que compartiste)
+    if Downloads then
+        local ok = pcall(function()
+            if not Downloads.is_cached(folderName, itemName) then
+                Downloads.download(folderName, itemName)
+            end
+        end)
+        if not ok and RouterClient then
+            -- 4) Fallback: pegarle directo al router (como en tu ejemplo de SimpleSpy)
+            pcall(function()
+                RouterClient.get("DownloadsAPI/Download"):InvokeServer(folderName, itemName)
+            end)
+        end
+    elseif RouterClient then
+        pcall(function()
+            RouterClient.get("DownloadsAPI/Download"):InvokeServer(folderName, itemName)
+        end)
+    end
+
+    -- 5) Esperar a que el modelo aparezca en workspace.Interiors
+    interiorsFolder = workspace:WaitForChild("Interiors", 5)
+    if not interiorsFolder then return false end
+
+    local t0 = os.clock()
+    while os.clock() - t0 < WAIT_DOWNLOAD do
+        if interiorsFolder:FindFirstChild(itemName) then return true end
+        task.wait(0.2)
+    end
+    return interiorsFolder:FindFirstChild(itemName) ~= nil
+end
+
+-- Busca la puerta hacia el destino como hace InteriorsM.get_door_to_location(),
+-- pero forzando primero la descarga del interior.
+local function findDoorToDestination(destId)
+    -- 1) asegurar que el interior esté en el mundo
+    if not ensureInterior("Interiors", destId) then
+        warn(("[DoorTP] No pude montar '%s'. Revisa que exista en ContentPack/Downloads."):format(destId))
+        return nil
+    end
+
+    -- 2) intentar la puerta exacta por convención
+    local container = workspace:FindFirstChild("Interiors")
+    if not container then return nil end
+
+    -- a) Interior directo con carpeta Doors
+    local model = container:FindFirstChild(destId)
+    if model and model:FindFirstChild("Doors") then
+        local door = model.Doors:FindFirstChild(DOOR_NAME) or model.Doors:FindFirstChildWhichIsA("Model")
+        if door then return door end
+    end
+
+    -- b) fallback: recorrer todos los interiores y comprobar destino_id en config
+    for _, inter in ipairs(container:GetChildren()) do
+        local Doors = inter:FindFirstChild("Doors")
+        if Doors then
+            for _, d in ipairs(Doors:GetChildren()) do
+                local cfg = d:FindFirstChild("WorkingParts")
+                    and d.WorkingParts:FindFirstChild("Configuration")
+                local destVal = cfg and cfg:FindFirstChild("destination_id")
+                if destVal and destVal.Value == destId then
+                    return d
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Teletransporte “insta” por puerta
+local function tpViaDoor(destId)
+    awaitChar()
+
+    -- Permitir tps sin esperar respawn (según tu InteriorsM)
+    if InteriorsM and InteriorsM.set_allow_non_character_teleports then
+        pcall(function() InteriorsM.set_allow_non_character_teleports(true) end)
+    end
+
+    -- Buscar puerta
+    local doorModel = findDoorToDestination(destId)
+    if not doorModel then
+        warn(("[DoorTP] No encontré una puerta hacia '%s'. ¿Existe en workspace.Interiors?"):format(destId))
+        return
+    end
+
+    -- Usar la API real de puertas
+    local DoorObj = DoorsM.get_door(doorModel)
+
+    -- Abrir visualmente y entrar con transición mínima
+    DoorObj:visually_open()
+    -- Llamamos enter con opciones para que sea lo más inmediato posible
+    -- (evita centrado, fade rápido y sin movimientos largos)
+    DoorObj:enter({
+        is_exit_button = false, -- entrada normal
+        -- studs_ahead_of_door = 0, -- opcional
+    })
+end
+
+-- === EJECUCIÓN INMEDIATA ===
+task.defer(function()
+    tpViaDoor(DEST_ID)
+end)
