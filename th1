@@ -1,0 +1,127 @@
+-- StarterPlayerScripts/TeleportToDebugInterior.client.lua
+-- TP inmediato a "DebugInterior" en cuanto el cliente arranca,
+-- con esperas seguras para que el framework esté listo.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LOCAL_PLAYER = Players.LocalPlayer
+local Fsys = ReplicatedStorage:WaitForChild("Fsys")
+local load = require(Fsys).load
+
+----------------------------------------------------------------------
+-- Helpers de arranque seguro
+----------------------------------------------------------------------
+
+-- Requiere un módulo de Fsys reintentando hasta que esté disponible.
+local function safeLoad(name, timeout)
+	timeout = timeout or 20
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.25)
+	end
+	error(("[DebugInterior TP] No pude cargar '%s' dentro del tiempo."):format(name))
+end
+
+-- Espera a que el framework esté listo para aceptar TP.
+local function waitForFrameworkReady()
+	-- Que exista PlayerGui (evita carreras al montar UI).
+	repeat task.wait() until LOCAL_PLAYER:FindFirstChild("PlayerGui")
+
+	-- Carga estable de módulos base; reintenta si aún no están listos.
+	local UIManager          = safeLoad("UIManager", 30)
+	local InteractionsEngine = safeLoad("InteractionsEngine", 30)
+	local InteriorsM         = safeLoad("InteriorsM", 30)
+
+	-- Si UIManager expone métodos de "ready", respétalos.
+	pcall(function()
+		if UIManager.await_ready then UIManager:await_ready() end
+		if UIManager.is_ready and not UIManager:is_ready() then
+			repeat task.wait(0.2) until UIManager:is_ready()
+		end
+	end)
+
+	return UIManager, InteractionsEngine, InteriorsM
+end
+
+local function canEnter(InteriorsM, dest)
+	local ok, reason = InteriorsM.can_enter(dest)
+	if not ok then
+		warn(("[DebugInterior TP] Bloqueado: %s"):format(tostring(reason)))
+	end
+	return ok
+end
+
+----------------------------------------------------------------------
+-- Teleport automático con fallbacks
+----------------------------------------------------------------------
+
+local DESTINATION_ID = "DebugInterior"
+local started = false
+
+local function doTeleport()
+	if started then return end
+	started = true
+	print("[DebugInterior TP] Iniciando TP…")
+
+	local UIManager, InteractionsEngine, InteriorsM = waitForFrameworkReady()
+
+	-- Permite TP incluso si el Character cambia durante el arranque.
+	if InteriorsM.set_allow_non_character_teleports then
+		InteriorsM.set_allow_non_character_teleports(true)
+	end
+
+	if not canEnter(InteriorsM, DESTINATION_ID) then
+		started = false
+		return
+	end
+
+	local opts = {
+		fade_in_length  = 0.5,
+		fade_out_length = 0.4,
+		move_camera     = true,
+		camera_zoom     = 12,
+		-- Si quieres forzar un punto exacto dentro del interior:
+		-- spawn_cframe = CFrame.new(x, y, z),
+	}
+
+	-- 1) Preferido: transición suave
+	local ok1, err1 = pcall(function()
+		InteriorsM.enter_smooth(DESTINATION_ID, nil, opts)
+	end)
+	if ok1 then
+		print("[DebugInterior TP] OK con enter_smooth.")
+		return
+	end
+	warn("[DebugInterior TP] enter_smooth falló: ", err1)
+
+	-- 2) Fallback: enter sin transición
+	local ok2, err2 = pcall(function()
+		InteriorsM.enter(DESTINATION_ID, nil, opts)
+	end)
+	if ok2 then
+		print("[DebugInterior TP] OK con enter (fallback).")
+		return
+	end
+	warn("[DebugInterior TP] enter falló: ", err2)
+
+	-- 3) Último recurso: pedir SetLocation al servidor y reintentar rápido
+	local ok3, err3 = pcall(function()
+		local Router = safeLoad("RouterClient", 10)
+		Router.get("LocationAPI/SetLocation"):FireServer(DESTINATION_ID, nil, nil)
+		task.wait(0.5)
+		pcall(function()
+			InteriorsM.enter(DESTINATION_ID, nil, opts)
+		end)
+	end)
+	if ok3 then
+		print("[DebugInterior TP] Forzado vía SetLocation (último recurso).")
+	else
+		warn("[DebugInterior TP] Fallback SetLocation falló: ", err3)
+	end
+end
+
+-- Lanzar TP lo antes posible sin bloquear el hilo principal de arranque
+task.defer(doTeleport)
