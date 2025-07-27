@@ -1,0 +1,132 @@
+-- StarterPlayerScripts/TeleportToDebugInterior.client.lua
+-- TP inmediato a DebugInterior USANDO PUERTAS (sin teclas).
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local LP   = Players.LocalPlayer
+local Fsys = ReplicatedStorage:WaitForChild("Fsys")
+local load = require(Fsys).load
+
+local DESTINATION_ID = "DebugInterior"
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+local function safeLoad(name, timeout)
+	timeout = timeout or 30
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.2)
+	end
+	error(("[DoorTP] No pude cargar '%s' a tiempo"):format(name))
+end
+
+local function waitForBootstrap()
+	-- PlayerGui montado + al menos un frame renderizado
+	repeat task.wait() until LP:FindFirstChild("PlayerGui")
+	RunService.RenderStepped:Wait()
+
+	local UIManager          = safeLoad("UIManager",          30)
+	local InteractionsEngine = safeLoad("InteractionsEngine", 30)
+	local InteriorsM         = safeLoad("InteriorsM",         30)
+	local DoorsM             = safeLoad("DoorsM",             30)
+
+	-- Espera “ready” si tu UIManager lo expone
+	pcall(function()
+		if UIManager.await_ready then UIManager:await_ready() end
+		if UIManager.is_ready and not UIManager:is_ready() then
+			repeat task.wait(0.2) until UIManager:is_ready()
+		end
+	end)
+
+	-- Colchón breve para que terminen limpiezas iniciales
+	task.wait(0.75)
+
+	-- Inicializa DoorsM si hace falta (idempotente)
+	pcall(function() if DoorsM.init then DoorsM.init() end end)
+
+	return UIManager, InteractionsEngine, InteriorsM, DoorsM
+end
+
+local function isAt(interiorsM, dest)
+	local ok, loc = pcall(interiorsM.get_current_location)
+	return ok and loc and loc.destination_id == dest
+end
+
+----------------------------------------------------------------------
+-- Flujo principal: buscar PUERTA -> abrir -> entrar
+----------------------------------------------------------------------
+
+local function doDoorTeleport()
+	print("[DoorTP] Arrancando…")
+	local _, _, InteriorsM, DoorsM = waitForBootstrap()
+
+	-- Busca la puerta que va a DebugInterior (puede tardar si stream/replicación)
+	local doorModel
+	local t0 = os.clock()
+	while os.clock() - t0 < 20 do
+		local ok, model = pcall(function()
+			return InteriorsM.get_door_to_location(DESTINATION_ID)
+		end)
+		if ok and model then doorModel = model; break end
+		task.wait(0.25)
+	end
+	if not doorModel then
+		warn("[DoorTP] No encontré una puerta hacia '"..DESTINATION_ID.."'. ¿Existe en workspace.Interiors?")
+		return
+	end
+
+	local door = DoorsM.get_door(doorModel)
+
+	-- Intentos con backoff usando *puertas*
+	local attempts, delay = 0, 0.6
+	while attempts < 4 do
+		attempts += 1
+
+		-- Por si ya estamos dentro
+		if isAt(InteriorsM, DESTINATION_ID) then
+			print("[DoorTP] Ya estás en el destino.")
+			return
+		end
+
+		-- Abre visualmente (mostrar conteo, animación, etc.)
+		pcall(function() door:open() end)
+		task.wait(0.1)
+
+		-- Entra por la puerta (usa su flujo completo: cámara, PassiveDoorEnter, etc.)
+		local okEnter, errEnter = pcall(function()
+			door:enter({
+				-- Si la puerta ya tiene el destino correcto en su Configuration,
+				-- no hace falta override. Si no, descomenta:
+				-- override_destination_id = DESTINATION_ID,
+				-- override_door_id = "MainDoor",
+			})
+		end)
+		if not okEnter then
+			warn("[DoorTP] door:enter() falló: ", errEnter)
+		else
+			-- Confirma cambio de ubicación
+			for _ = 1, 30 do
+				if isAt(InteriorsM, DESTINATION_ID) then
+					print("[DoorTP] ¡Entraste por la PUERTA correctamente!")
+					return
+				end
+				task.wait(0.1)
+			end
+		end
+
+		-- Espera un poco y reintenta (puede estar limpiando packs/UI)
+		task.wait(delay)
+		delay = math.min(delay + 0.5, 2.0)
+	end
+
+	warn("[DoorTP] No se pudo entrar tras varios intentos usando puertas. Revisa el destino o el estado del jugador/minijuego.")
+end
+
+-- Ejecuta lo antes posible sin bloquear el arranque
+task.defer(doDoorTeleport)
