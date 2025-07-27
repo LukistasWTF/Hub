@@ -1,0 +1,95 @@
+-- LocalScript
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys"))
+
+-- Cargar dependencias
+local Debug = Fsys.load("Debug")
+local RouterClient = Fsys.load("RouterClient")
+local Promise = Fsys.load("package:Promise")
+local StreamingHelper = Fsys.load("new:StreamingHelper")
+local Signal = Fsys.load("Signal")
+
+-- ========================
+-- Módulo interno DownloadsAPI adaptado
+-- ========================
+local create_log = Debug.create_log()
+local download_signal = Signal.new()
+
+local downloads_cache = {}
+local downloads_active = {}
+local downloads_timestamps = {}
+
+local function download_with_retry(folder, subfolder)
+	while true do
+		local result = RouterClient.get("DownloadsAPI/Download"):InvokeServer(folder, subfolder)
+		if result.download_model_id then
+			result.download_model = StreamingHelper.await(result.download_model_id)
+			return result
+		end
+		if result.status == "RATE_LIMITED" then
+			create_log("Client's download was rate limited with parameters", folder, subfolder)
+			task.wait(1)
+		else
+			error("Download failed for "..folder.."/"..subfolder..". Status: "..result.status)
+		end
+	end
+end
+
+local function download(folder, subfolder)
+	local cacheKey = folder.."/"..subfolder.."/"
+	if downloads_cache[cacheKey] then
+		create_log("Returning cached download ("..cacheKey..")")
+		download_signal:Fire(0, folder, subfolder)
+		return downloads_cache[cacheKey]
+	end
+
+	if downloads_active[cacheKey] then
+		create_log("Waiting for existing download ("..cacheKey..")")
+		repeat task.wait(0.1) until not downloads_active[cacheKey]
+		return downloads_cache[cacheKey]
+	end
+
+	downloads_active[cacheKey] = true
+	local result = download_with_retry(folder, subfolder)
+	download_signal:Fire(os.clock(), folder, subfolder)
+
+	local clone = result.download_model:Clone()
+	result.download_model:Destroy()
+
+	downloads_cache[cacheKey] = clone
+	downloads_timestamps[cacheKey] = tick()
+
+	if result.received_remote_event then
+		result.received_remote_event:FireServer()
+	end
+
+	downloads_active[cacheKey] = nil
+	return clone
+end
+
+-- ========================
+-- Módulo interno LocationAPI adaptado
+-- ========================
+local Location = Fsys.load("Location")
+local function teleport(destinationId)
+	-- Usa enter_smooth que encapsula toda la lógica interna, incluyendo streaming, control del jugador, lighting, pets, etc.
+	Location.enter_smooth(destinationId)
+end
+
+-- ========================
+-- FLUJO PRINCIPAL
+-- ========================
+
+-- 1. Descargar Interior
+local model = download("Interiors", "Cave")
+if model then
+	model.Parent = workspace
+	print("Modelo descargado:", model.Name)
+else
+	warn("No se pudo descargar el modelo.")
+end
+
+-- 2. Teletransportarse a Cave
+task.wait(1)
+teleport("Cave")
