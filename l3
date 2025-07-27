@@ -1,0 +1,444 @@
+--[[
+AutoMinigames – Smart Queue + Real ETA + RouterTP (v4.3) 🚀
+- TP 100% por RouterClient (AdoptAPI/SendPassiveDoorEnter) con spawn_cframe.
+- CERO UIManager (evita "Cannot require a non-RobloxScript...").
+- Se une a la cola con menor ETA y se queda hasta que empiece.
+- Auto‑play joetation / coconut_bonk + claim de recompensas.
+]]
+
+------------------ Cliente obligatorio ------------------
+local RunService = game:GetService("RunService")
+if not RunService:IsClient() then warn("[AutoMG] Debe ser LocalScript."); return end
+
+------------------ Servicios ------------------
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local StarterGui         = game:GetService("StarterGui")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualUser        = game:GetService("VirtualUser")
+local LocalPlayer        = Players.LocalPlayer
+if not LocalPlayer then warn("[AutoMG] LocalPlayer nil."); return end
+
+------------------ Fsys / loader seguro ------------------
+local function isMS(x) return typeof(x)=="Instance" and x:IsA("ModuleScript") end
+local function srequire(ms) if not isMS(ms) then return nil end local ok,r=pcall(function() return require(ms) end); return ok and r or nil end
+
+local FsysMS = ReplicatedStorage:FindFirstChild("Fsys")
+local Fsys   = srequire(FsysMS)
+local FSYS_LOAD = (Fsys and type(Fsys.load)=="function") and Fsys.load or nil
+
+local function loadM(name)
+	if FSYS_LOAD then local ok,mod=pcall(function() return FSYS_LOAD(name) end); if ok and mod then return mod end end
+	for _,root in ipairs({"ClientModules","SharedModules"}) do
+		local f = ReplicatedStorage:FindFirstChild(root, true)
+		if f then local m=f:FindFirstChild(name, true); local got=srequire(m); if got then return got end end
+	end
+	return nil
+end
+
+------------------ Módulos ------------------
+local LiveOpsTime           = loadM("LiveOpsTime") or { now=function() return os.clock() end }
+local ClientToolManager     = loadM("ClientToolManager") or { now=function() return LiveOpsTime.now() end }
+local MinigameClientManager = loadM("MinigameClientManager")
+local RouterClient          = loadM("RouterClient")  -- para usar rutas API
+local ClientData            = loadM("ClientData")    -- opcional
+
+------------------ Config ------------------
+local CONFIG = {
+	games = {
+		joetation     = { name="Joetation" },
+		coconut_bonk  = { name="Coconut Bonk" },
+	},
+	order = { "joetation", "coconut_bonk" },
+
+	-- Cadencia
+	actionCadence  = { joetation = 1.25, coconut_bonk = 1.50 },
+	minCadence = 0.6, maxCadence = 2.5, cadenceStepDown = 0.10, cadenceStepUp = 0.15,
+
+	-- ETA / polling
+	defaultQueueCountdown = 12,
+	inProgressGrace       = 5,
+	statusRefresh         = 1.0,
+
+	-- Movimiento opcional
+	moveAggressive = true, moveRadiusStop = 10,
+
+	-- TP (Router)
+	routerTimeout   = 6.0,   -- tiempo máx. a esperar tras enviar la llamada
+	useDoorRoute    = "AdoptAPI/SendPassiveDoorEnter", -- ruta real usada por InteriorsM
+
+	-- Anti‑AFK
+	AFK_ENABLED = true,
+
+	-- Panel
+	debugPanel=true, maxLogLines=18,
+}
+
+------------------ UI / Logs (sin UIManager) ------------------
+local function nowText() return os.date("%Y-%m-%d %H:%M:%S") end
+local function fmtTime(s) s = math.max(0, math.floor(s)); return string.format("%02d:%02d", math.floor(s/60), s%60) end
+
+local debugGui, debugTextLabel, infoLine
+local logBuf = {}
+local function ensureDebugGui()
+	if not CONFIG.debugPanel or debugGui then return end
+	local sg = Instance.new("ScreenGui"); sg.Name="AutoMG_Debug"; sg.ResetOnSpawn=false; sg.IgnoreGuiInset=true; sg.DisplayOrder=1000
+	sg.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	local frame = Instance.new("Frame"); frame.Name="Panel"; frame.Position=UDim2.new(0,12,0,12); frame.Size=UDim2.new(0,520,0,340)
+	frame.BackgroundColor3=Color3.fromRGB(20,20,28); frame.BackgroundTransparency=0.15; frame.BorderSizePixel=0; frame.Parent=sg
+	Instance.new("UICorner", frame).CornerRadius=UDim.new(0,12)
+	local title = Instance.new("TextLabel"); title.Size=UDim2.new(1,-16,0,28); title.Position=UDim2.new(0,8,0,8)
+	title.BackgroundTransparency=1; title.TextXAlignment=Enum.TextXAlignment.Left; title.Font=Enum.Font.GothamBold; title.TextSize=18
+	title.Text="🤖 AutoMinigames v4.3 – Smart Queue + RouterTP"; title.TextColor3=Color3.fromRGB(255,255,255); title.Parent=frame
+	local info = Instance.new("TextLabel"); info.Name="Info"; info.Size=UDim2.new(1,-16,0,18); info.Position=UDim2.new(0,8,0,36)
+	info.BackgroundTransparency=1; info.TextXAlignment=Enum.TextXAlignment.Left; info.Font=Enum.Font.Code; info.TextSize=14
+	info.Text="—"; info.TextColor3=Color3.fromRGB(255,240,180); info.Parent=frame; infoLine=info
+	local box = Instance.new("TextLabel"); box.Name="Log"; box.Size=UDim2.new(1,-16,1,-64); box.Position=UDim2.new(0,8,0,58)
+	box.BackgroundTransparency=1; box.TextXAlignment=Enum.TextXAlignment.Left; box.TextYAlignment=Enum.TextYAlignment.Top
+	box.Font=Enum.Font.Code; box.TextSize=15; box.Text=""; box.TextColor3=Color3.fromRGB(220,235,255); box.Parent=frame
+	debugGui, debugTextLabel = sg, box
+end
+local function pushLog(s) if not (CONFIG.debugPanel and debugTextLabel) then return end
+	table.insert(logBuf, s); while #logBuf>CONFIG.maxLogLines do table.remove(logBuf,1) end
+	debugTextLabel.Text = table.concat(logBuf, "\n")
+end
+local function toast(msg) pcall(function() StarterGui:SetCore("SendNotification", {Title="AutoMG", Text=msg, Duration=2}) end) end
+local function LOG(tag, icon, msg) local line=string.format("%s[%s %s] %s", nowText(), tag, icon, msg); print(line); pushLog(line); toast(icon.." "..msg) end
+local function LOGP(tag, icon, msg) local line=string.format("%s[%s %s] %s", nowText(), tag, icon, msg); print(line); pushLog(line) end
+
+------------------ Helpers ------------------
+local function hrp() local c=LocalPlayer.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function humanoid() local c=LocalPlayer.Character; return c and c:FindFirstChildWhichIsA("Humanoid") end
+local function serverNow() if workspace.GetServerTimeNow then return workspace:GetServerTimeNow() end return LiveOpsTime.now() end
+
+------------------ Movimiento opcional ------------------
+local function moveTo(target)
+	if not CONFIG.moveAggressive then return end
+	local hum, root = humanoid(), hrp(); if not (hum and root) then return end
+	if (root.Position - target).Magnitude <= CONFIG.moveRadiusStop then return end
+	local path = PathfindingService:CreatePath()
+	local ok = pcall(function() path:ComputeAsync(root.Position, target) end)
+	if not ok or path.Status ~= Enum.PathStatus.Success then hum:MoveTo(target); return end
+	for _, wp in ipairs(path:GetWaypoints()) do hum:MoveTo(wp.Position) end
+end
+
+------------------ Cliente MG ------------------
+local function getClient(id)
+	if not MinigameClientManager then return nil end
+	local ok, cli = pcall(function() return MinigameClientManager.get(id) end)
+	return ok and cli or nil
+end
+
+-- Estado + ETA real
+local function readStatus(cli)
+	local st = { active=false, loading=false, inQueue=false, timeLeft=nil, raw=nil }
+	local ms = cli and cli.minigame_state
+	local now = serverNow()
+
+	if ms then
+		local get = (type(ms.get)=="function") and function(k) local ok,v=pcall(function() return ms:get(k) end); return ok and v or nil end or function() return nil end
+		st.active  = get("is_game_active") or false
+		st.loading = get("players_loading") or false
+		if type(ms.get_as_table)=="function" then
+			local t=nil; pcall(function() t = ms:get_as_table("queued_user_ids") end)
+			if type(t)=="table" then for _,uid in ipairs(t) do if uid==LocalPlayer.UserId then st.inQueue=true break end end end
+		end
+		local zts = get("zone_override_timestamp")
+		if typeof(zts)=="number" and zts>0 then st.timeLeft = math.max(0, math.floor(zts - now)); st.raw="zone_override_timestamp" end
+	end
+	if cli and cli.is_participating and cli.end_time then
+		st.active = true; st.timeLeft = math.max(0, math.floor(cli.end_time - now)); st.raw = st.raw or "client.end_time"
+	end
+	if (not st.timeLeft) and ClientData and cli and cli.cycle_timestamp_key then
+		pcall(function()
+			local rec = ClientData.get(cli.cycle_timestamp_key)
+			local ts = rec and (rec.timestamp or rec.t or rec.next_timestamp)
+			if ts then st.timeLeft = math.max(0, math.floor(ts - now)); st.raw = "ClientData.cycle_timestamp" end
+		end)
+	end
+	return st
+end
+
+local function estimateSecondsToStart(cli, st)
+	if st.active then return (st.timeLeft or CONFIG.defaultQueueCountdown) + CONFIG.inProgressGrace, false, st.raw end
+	if st.loading then return 5, true, "players_loading" end
+	if st.timeLeft and st.timeLeft>0 then return st.timeLeft, true, st.raw end
+	return CONFIG.defaultQueueCountdown, true, "fallback"
+end
+
+------------------ TP por RouterClient (sin UI) ------------------
+local function findTeleportLocationCF(cli)
+	local cf=nil
+	pcall(function()
+		local locs = workspace:FindFirstChild("StaticMap") and workspace.StaticMap:FindFirstChild("TeleportLocations")
+		if locs and cli and cli.minigame_id then
+			local n = cli.minigame_id
+			local p = locs:FindFirstChild(n) or locs:FindFirstChild((n or ""):gsub("^%l", string.upper))
+			if p and p:IsA("BasePart") then cf = p.CFrame end
+		end
+	end)
+	return cf
+end
+
+local function tpViaRouter(dest, door, spawnCF)
+	-- Implementa: RouterClient.get("AdoptAPI/SendPassiveDoorEnter"):FireServer(dest, door, settings)
+	if not RouterClient or type(RouterClient.get)~="function" then return false end
+	local remote = nil
+	local okg, r = pcall(function() return RouterClient.get(CONFIG.useDoorRoute) end)
+	if okg and r then remote = r end
+	if not (remote and remote.FireServer) then return false end
+
+	local settings = { start_transparency = 1, spawn_cframe = spawnCF }
+	LOG("tp","🛫",("RouterTP → %s (%s)"):format(tostring(dest), tostring(door)))
+	local ok = pcall(function() remote:FireServer(dest, door, settings) end)
+	if not ok then LOG("tp","⚠️","RouterTP: FireServer falló."); return false end
+
+	-- Espera corta a que el server nos reubique
+	local t0 = tick()
+	repeat task.wait(0.1) until (tick()-t0)>CONFIG.routerTimeout or (hrp() and (spawnCF and (hrp().Position-spawnCF.Position).Magnitude<15))
+	if hrp() and spawnCF and (hrp().Position-spawnCF.Position).Magnitude<15 then
+		LOG("tp","✅","RouterTP completado.")
+		return true
+	else
+		LOG("tp","⏱️","RouterTP sin confirmación, haré fallback.")
+		return false
+	end
+end
+
+local function tpToJoinZone(cli)
+	local dest = (cli and cli.join_zone_destination_id) or "MainMap"
+	local door = "MainDoor"
+	local spawnCF = findTeleportLocationCF(cli)
+	-- 1) RouterClient directo
+	if tpViaRouter(dest, door, spawnCF) then return true end
+	-- 2) Fallback CFrame
+	if spawnCF and hrp() then hrp().CFrame = spawnCF + Vector3.new(0,3,0); LOG("tp","🛰️","Fallback CFrame a TeleportLocations."); return true end
+	-- 3) Último recurso: moverse
+	if spawnCF then moveTo(spawnCF.Position) end
+	return false
+end
+
+------------------ Auto‑play ------------------
+local dynCadence, lastActionAt, actionsCount = {}, {}, {}
+for k,v in pairs(CONFIG.actionCadence) do dynCadence[k]=v end
+local windowStart = LiveOpsTime.now()
+local function updInfo()
+	if not infoLine then return end
+	local parts = {}
+	for _, id in ipairs(CONFIG.order) do
+		local apm, elapsed = 0, math.max(1, LiveOpsTime.now() - windowStart)
+		if actionsCount[id] then apm = math.floor(actionsCount[id]*60/elapsed) end
+		table.insert(parts, string.format("%s: APM %d | cad %.2fs", id, apm, dynCadence[id] or 0))
+	end
+	infoLine.Text = table.concat(parts, "  •  ")
+end
+local function canAct(id)
+	local cad = dynCadence[id] or 2.0
+	local t = LiveOpsTime.now()
+	if not lastActionAt[id] or (t-lastActionAt[id])>=cad then lastActionAt[id]=t; return true end
+	return false
+end
+local function adjustCadence(id, ok)
+	local cad = dynCadence[id] or 2.0
+	if ok then cad = math.max(CONFIG.minCadence, cad-CONFIG.cadenceStepDown)
+	else cad = math.min(CONFIG.maxCadence, cad+CONFIG.cadenceStepUp) end
+	dynCadence[id]=cad; updInfo()
+end
+
+local function act_joetation(cli)
+	if not canAct("joetation") then return end
+	local root = hrp(); local pos = root and root.Position or Vector3.new()
+	if cli.pickup_pile_position then moveTo(cli.pickup_pile_position) end
+	local ok1 = pcall(function() return cli:message_server("pickup_holdable_from_pile", pos, (ClientToolManager.now and ClientToolManager.now() or LiveOpsTime.now())) end)
+	local idx = math.random(1,12)
+	if cli.cannons_world and #cli.cannons_world>0 and pos then
+		local me, best, bestIdx = pos
+		for i,p in ipairs(cli.cannons_world) do local d=(p-me).Magnitude; if not best or d<best then best,bestIdx=d,i end end
+		if bestIdx then idx=bestIdx end
+	end
+	local ok2 = pcall(function() return cli:message_server("use_cannon", idx, pos, (ClientToolManager.now and ClientToolManager.now() or LiveOpsTime.now())) end)
+	actionsCount.joetation = (actionsCount.joetation or 0) + 1
+	LOG("joetation","🎯","Disparo cañón #"..idx)
+	adjustCadence("joetation", ok1 or ok2)
+end
+
+local function act_coconut(cli)
+	if not canAct("coconut_bonk") then return end
+	pcall(function() cli:message_server("pickup_droppable", 1) end)
+	local root = hrp(); local me = root and root.Position or Vector3.new()
+	local bestUid, bestScore = nil, -1
+	if cli.ships_by_uid then
+		for uid, ship in pairs(cli.ships_by_uid) do
+			local hp, p = 1, nil
+			pcall(function()
+				if ship.ship_data and ship.ship_data.health then hp = ship.ship_data.health end
+				if ship.base and ship.base.PrimaryPart then p = ship.base.PrimaryPart.Position end
+			end)
+			local dist = p and (p-me).Magnitude or 1000
+			local score = hp - dist*0.02
+			if score>bestScore then bestScore, bestUid = score, uid end
+		end
+	end
+	if bestUid then
+		local ok = pcall(function() return cli:message_server("used_droppable", bestUid) end)
+		actionsCount.coconut_bonk = (actionsCount.coconut_bonk or 0) + 1
+		LOG("coconut_bonk","🥥","Lanzado a "..tostring(bestUid))
+		adjustCadence("coconut_bonk", ok)
+	end
+end
+
+------------------ Recompensas ------------------
+local rewardRoutes = { "claim_rewards","collect_rewards","request_rewards","request_reward_payout","claim_payout","claim_xp" }
+local function tryClaimRewards(id, cli)
+	for _, r in ipairs(rewardRoutes) do
+		if pcall(function() return cli:message_server(r) end) then LOG(id,"🏆","Recompensas ("..r..")"); return end
+	end
+	if cli.ingame_app_controller then
+		for _, m in ipairs({"claimRewards","ClaimRewards","Finish","finish","Complete","complete"}) do
+			local f = cli.ingame_app_controller[m]
+			if typeof(f)=="function" and pcall(function() f(cli.ingame_app_controller) end) then
+				LOG(id,"🏆","Recompensas via controller ("..m..")"); return
+			end
+		end
+	end
+end
+
+------------------ Colas ------------------
+local function attemptJoin(id, st)
+	local cli = getClient(id); if not cli then return false end
+	if st.inQueue then LOG(id,"✅","Ya en cola."); return true end
+	if st.active then return false end
+	tpToJoinZone(cli)
+	local ok=false
+	if cli.join_persistent_game then ok=pcall(function() cli:join_persistent_game() end) end
+	if (not ok) and cli.message_server then ok=pcall(function() cli:message_server("join_queue") end) end
+	if ok then LOG(id,"🕒","Entré a la cola.") end
+	return ok
+end
+
+local function readStatusAndEta(id)
+	local cli = getClient(id); if not cli then return nil end
+	local st = readStatus(cli)
+	local eta, joinable, raw = estimateSecondsToStart(cli, st)
+	return { cli=cli, st=st, eta=eta, joinable=joinable, raw=raw }
+end
+
+local function pickBestQueue()
+	local bestId, bestEta, bestJoinable
+	for _, id in ipairs(CONFIG.order) do
+		local r = readStatusAndEta(id)
+		if r then
+			if r.eta < (bestEta or math.huge) then bestId, bestEta, bestJoinable = id, r.eta, r.joinable end
+			LOG(id,"🧮", string.format("ETA %s (%s) | active=%s loading=%s inQueue=%s",
+				fmtTime(r.eta), tostring(r.raw or "fallback"), tostring(r.st.active), tostring(r.st.loading), tostring(r.st.inQueue)))
+		end
+	end
+	return bestId, bestEta, bestJoinable
+end
+
+------------------ Ciclo ------------------
+local playing, mgEndsAt = {}, {}
+local currentGame, queuedThisCycle, queuedGameId = nil, false, nil
+local lastQueueLogSec = -1
+
+local function onGameStarted(id, cli)
+	playing[id], currentGame = true, id
+	actionsCount[id], windowStart = 0, LiveOpsTime.now()
+	local left = cli and cli.end_time and math.max(0, math.floor(cli.end_time - serverNow())) or nil
+	if left then mgEndsAt[id] = serverNow() + left end
+	LOG(id,"🚀","¡Partida iniciada! ⏱️ "..fmtTime(left or 0))
+end
+local function onGameEnded(id, cli)
+	playing[id] = false; if currentGame==id then currentGame=nil end; mgEndsAt[id]=nil
+	LOG(id,"🏁","Fin de partida. Reclamando recompensas…"); tryClaimRewards(id, cli)
+	queuedThisCycle, queuedGameId = false, nil
+	lastQueueLogSec = -1
+	LOG(id,"🔁","Nuevo ciclo → elegiré de nuevo la cola con menor ETA.")
+end
+
+------------------ Anti‑AFK ------------------
+local AFK = { enabled = CONFIG.AFK_ENABLED, conns={}, lastW=0 }
+local function enableAFK()
+	if not AFK.enabled or #AFK.conns>0 then return end
+	LOG("afk","🛡️","Anti‑AFK ON.")
+	table.insert(AFK.conns, LocalPlayer.Idled:Connect(function()
+		VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new()); LOG("afk","🖱️","Ping anti‑idle.")
+	end))
+	table.insert(AFK.conns, RunService.Heartbeat:Connect(function()
+		local t=LiveOpsTime.now(); if t-AFK.lastW>30 then local r=hrp(); if r then r.CFrame=r.CFrame*CFrame.Angles(0, math.rad(1), 0) end AFK.lastW=t; LOG("afk","🎮","Wiggle.") end
+	end))
+end
+
+------------------ Arranque ------------------
+ensureDebugGui()
+if AFK.enabled then enableAFK() end
+LOG("init","✨","AutoMinigames v4.3 listo.")
+LOG("init","🎯","Estrategia: unirse a la cola con menor ETA y quedarse hasta que empiece.")
+
+task.spawn(function()
+	while true do
+		if not currentGame and not queuedThisCycle then
+			local bestId, eta, joinable = pickBestQueue()
+			if bestId then
+				if joinable then
+					local r = readStatusAndEta(bestId)
+					if attemptJoin(bestId, r and r.st or {}) or (r and r.st and r.st.inQueue) then
+						queuedThisCycle, queuedGameId = true, bestId
+						lastQueueLogSec = -1
+					else
+						task.wait(math.max(2, math.min(eta or 5, 10)))
+					end
+				else
+					LOG(bestId,"⏳","Esperando disponibilidad (~"..fmtTime(eta)..").")
+					task.wait(math.max(CONFIG.statusRefresh, eta))
+				end
+			else
+				task.wait(1.0)
+			end
+		else
+			if queuedThisCycle and queuedGameId and not currentGame then
+				local r = readStatusAndEta(queuedGameId)
+				if r then
+					local seconds = math.max(0, math.floor(r.eta))
+					if seconds ~= lastQueueLogSec then
+						LOGP(queuedGameId, "⌛", "En cola — empieza en T‑"..fmtTime(seconds).." ("..tostring(r.raw or "fallback")..")")
+						lastQueueLogSec = seconds
+					end
+					if r.st.active then local cli=getClient(queuedGameId); if cli then onGameStarted(queuedGameId, cli) end end
+					task.wait(CONFIG.statusRefresh)
+				else
+					task.wait(CONFIG.statusRefresh)
+				end
+			else
+				task.wait(0.1)
+			end
+		end
+
+		-- Juego activo
+		for _, id in ipairs(CONFIG.order) do
+			local cli = getClient(id)
+			if cli and cli.is_participating then
+				if currentGame ~= id or not playing[id] then onGameStarted(id, cli) end
+				if id=="joetation" then act_joetation(cli)
+				elseif id=="coconut_bonk" then act_coconut(cli)
+				else pcall(function() cli:message_server("heartbeat") end) end
+			end
+			local etaEnd = mgEndsAt[id]
+			if etaEnd and cli and cli.is_participating then
+				local rem = math.max(0, math.floor(etaEnd - serverNow()))
+				if rem % 5 == 0 then LOG(id,"⏳","Quedan "..fmtTime(rem)) end
+				if rem==0 then tryClaimRewards(id, cli); mgEndsAt[id]=nil end
+			end
+			if cli and (not cli.is_participating) and playing[id] then onGameEnded(id, cli) end
+		end
+	end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function() LOG("player","🧍","Character listo; reanudando.") end)
+
+-- Atajos
+pcall(function()
+	LocalPlayer.Chatted:Connect(function(msg)
+		if msg == "!automg panel" and debugGui then debugGui.Enabled = not debugGui.Enabled; LOG("ui","🖥️","Panel "..(debugGui.Enabled and "ON" or "OFF")) end
+	end)
+end)
