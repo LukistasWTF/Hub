@@ -1,0 +1,155 @@
+-- StarterPlayerScripts/TeleportToDebugInterior.client.lua
+-- TP inmediato y robusto a "DebugInterior" sin tecla y sin spam de errores.
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local RunService         = game:GetService("RunService")
+
+local LOCAL_PLAYER = Players.LocalPlayer
+local Fsys         = ReplicatedStorage:WaitForChild("Fsys")
+local load         = require(Fsys).load
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+-- Carga un módulo de Fsys reintentando hasta que esté disponible.
+local function safeLoad(name, timeout)
+	timeout = timeout or 30
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.2)
+	end
+	error(("[DebugInterior TP] No pude cargar '%s' a tiempo"):format(name))
+end
+
+-- Espera señales de “cliente montado” y un pequeño colchón para packs/UI.
+local function waitForBootstrap()
+	-- PlayerGui listo
+	repeat task.wait() until LOCAL_PLAYER:FindFirstChild("PlayerGui")
+
+	-- Primer frame renderizado (la cámara existe y varios Apps se montan)
+	RunService.RenderStepped:Wait()
+
+	-- Carga estable de módulos base (reintenta internamente)
+	local UIManager          = safeLoad("UIManager",          30)
+	local InteractionsEngine = safeLoad("InteractionsEngine", 30)
+	local InteriorsM         = safeLoad("InteriorsM",         30)
+
+	-- Si tu UIManager expone “ready”, respétalo (no todos lo tienen)
+	pcall(function()
+		if UIManager.await_ready then UIManager:await_ready() end
+		if UIManager.is_ready and not UIManager:is_ready() then
+			repeat task.wait(0.2) until UIManager:is_ready()
+		end
+	end)
+
+	-- Pequeño colchón adicional: deja que ContentPackHelper termine su “cleanup”
+	task.wait(0.75)
+
+	return UIManager, InteractionsEngine, InteriorsM
+end
+
+-- Confirma entrada comparando la localización actual
+local function isAt(interiorsM, dest)
+	local ok, loc = pcall(interiorsM.get_current_location)
+	if not ok or not loc then return false end
+	return loc.destination_id == dest
+end
+
+----------------------------------------------------------------------
+-- TP con reintentos y confirmación
+----------------------------------------------------------------------
+
+local DESTINATION_ID = "DebugInterior"
+
+local function doTeleport()
+	print("[DebugInterior TP] Iniciando TP…")
+	local _, _, InteriorsM = waitForBootstrap()
+
+	-- Permitir TP aunque el Character aún no esté “estable”
+	if InteriorsM.set_allow_non_character_teleports then
+		InteriorsM.set_allow_non_character_teleports(true)
+	end
+
+	-- Config “suave”
+	local opts = {
+		fade_in_length  = 0.5,
+		fade_out_length = 0.4,
+		move_camera     = true,
+		camera_zoom     = 12,
+	}
+
+	-- Reintentos con backoff y verificación final
+	local attempts, delay = 0, 0.6
+	while attempts < 4 do
+		attempts += 1
+
+		-- Si ya estamos dentro, salimos sin hacer nada
+		if isAt(InteriorsM, DESTINATION_ID) then
+			print("[DebugInterior TP] Ya estás en el destino.")
+			return
+		end
+
+		-- 1) Preferido: transición suave
+		local ok1, err1 = pcall(function()
+			InteriorsM.enter_smooth(DESTINATION_ID, nil, opts)
+		end)
+		if ok1 then
+			-- Confirma que realmente cambió la ubicación
+			for _ = 1, 20 do
+				if isAt(InteriorsM, DESTINATION_ID) then
+					print("[DebugInterior TP] OK con enter_smooth.")
+					return
+				end
+				task.wait(0.1)
+			end
+		else
+			warn("[DebugInterior TP] enter_smooth falló: ", err1)
+		end
+
+		-- 2) Fallback simple
+		local ok2, err2 = pcall(function()
+			InteriorsM.enter(DESTINATION_ID, nil, opts)
+		end)
+		if ok2 then
+			for _ = 1, 20 do
+				if isAt(InteriorsM, DESTINATION_ID) then
+					print("[DebugInterior TP] OK con enter (fallback).")
+					return
+				end
+				task.wait(0.1)
+			end
+		else
+			warn("[DebugInterior TP] enter falló: ", err2)
+		end
+
+		-- 3) Último recurso: notificar al servidor y reintentar corto
+		local ok3 = pcall(function()
+			local Router = safeLoad("RouterClient", 10)
+			Router.get("LocationAPI/SetLocation"):FireServer(DESTINATION_ID, nil, nil)
+		end)
+		if ok3 then
+			task.wait(0.5)
+			pcall(function() InteriorsM.enter(DESTINATION_ID, nil, opts) end)
+			for _ = 1, 20 do
+				if isAt(InteriorsM, DESTINATION_ID) then
+					print("[DebugInterior TP] Forzado vía SetLocation (último recurso).")
+					return
+				end
+				task.wait(0.1)
+			end
+		end
+
+		-- Si seguimos fuera, esperamos un poco más (deja respirar al ContentPackHelper)
+		task.wait(delay)
+		delay = math.min(delay + 0.5, 2.0)
+	end
+
+	warn("[DebugInterior TP] No se pudo entrar tras varios intentos. Revisa el ID o si hay minijuego/estado que lo bloquee.")
+end
+
+-- Lanza el TP lo antes posible sin bloquear el arranque
+task.defer(doTeleport)
