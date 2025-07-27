@@ -1,0 +1,177 @@
+-- StarterPlayerScripts/TeleportToDebugInterior.client.lua
+-- Entra a DebugInterior usando PUERTAS; si no hay puerta real, crea una temporal.
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local LP   = Players.LocalPlayer
+local Fsys = ReplicatedStorage:WaitForChild("Fsys")
+local load = require(Fsys).load
+
+local DESTINATION_ID = "DebugInterior"
+
+----------------------------------------------------------------------
+-- Utilidades
+----------------------------------------------------------------------
+
+local function safeLoad(name, timeout)
+	timeout = timeout or 30
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.2)
+	end
+	error(("[DoorTP] No pude cargar '%s' a tiempo"):format(name))
+end
+
+local function waitForBootstrap()
+	repeat task.wait() until LP:FindFirstChild("PlayerGui")
+	RunService.RenderStepped:Wait()
+
+	local UIManager          = safeLoad("UIManager",          30)
+	local InteractionsEngine = safeLoad("InteractionsEngine", 30)
+	local InteriorsM         = safeLoad("InteriorsM",         30)
+	local DoorsM             = safeLoad("DoorsM",             30)
+
+	pcall(function()
+		if UIManager.await_ready then UIManager:await_ready() end
+		if UIManager.is_ready and not UIManager:is_ready() then
+			repeat task.wait(0.2) until UIManager:is_ready()
+		end
+	end)
+
+	-- DoorsM.init es idempotente; por si aún no está
+	pcall(function() if DoorsM.init then DoorsM.init() end end)
+
+	task.wait(0.6) -- colchón para limpiezas iniciales
+	return UIManager, InteractionsEngine, InteriorsM, DoorsM
+end
+
+local function isAt(InteriorsM, dest)
+	local ok, loc = pcall(InteriorsM.get_current_location)
+	return ok and loc and loc.destination_id == dest
+end
+
+-- Busca una puerta real en workspace.Interiors que tenga destination_id = DESTINATION_ID
+local function findRealDoor(InteriorsM, waitSeconds)
+	waitSeconds = waitSeconds or 20
+	local t0 = os.clock()
+	while os.clock() - t0 < waitSeconds do
+		local ok, model = pcall(InteriorsM.get_door_to_location, DESTINATION_ID)
+		if ok and model then return model end
+		task.wait(0.25)
+	end
+end
+
+-- Crea una PUERTA temporal invisible compatible con Door:enter
+local function createTempDoor(humCFrame)
+	local model = Instance.new("Model")
+	model.Name = "TempDoor_Debug"
+
+	local working = Instance.new("Model")
+	working.Name = "WorkingParts"
+	working.Parent = model
+
+	local conf = Instance.new("Folder")
+	conf.Name = "Configuration"
+	conf.Parent = working
+
+	local sv = Instance.new("StringValue")
+	sv.Name = "destination_id"
+	sv.Value = DESTINATION_ID
+	sv.Parent = conf
+
+	-- Opcional: color de transición
+	-- local col = Instance.new("Color3Value"); col.Name = "TransitionColor"; col.Value = Color3.new(1,1,1); col.Parent = conf
+
+	-- Ubica la puerta delante del jugador y mirando hacia él (para que el flujo de Door funcione bien)
+	local ahead = humCFrame * CFrame.new(0, 0, -6)
+	local doorCF = CFrame.lookAt(ahead.Position, humCFrame.Position)
+
+	local p = Instance.new("Part")
+	p.Name = "TouchToEnter"
+	p.Anchored = true
+	p.CanCollide = false
+	p.Transparency = 1
+	p.Size = Vector3.new(6, 6, 2)
+	p.CFrame = doorCF
+	p.Parent = working
+
+	model.Parent = workspace
+	return model
+end
+
+----------------------------------------------------------------------
+-- Flujo principal: PUERTAS reales -> PUERTA temporal -> InteriorsM
+----------------------------------------------------------------------
+
+local function enterViaDoor(DoorsM, doorModel, useOpen)
+	local door = DoorsM.get_door(doorModel)
+	if useOpen then pcall(function() door:open() end) end -- animación/contador si la puerta real lo permite
+	local ok, err = pcall(function()
+		door:enter({
+			-- Si tu puerta real no tuviera bien el destino, descomenta:
+			-- override_destination_id = DESTINATION_ID,
+			-- override_door_id = "MainDoor",
+		})
+	end)
+	return ok, err
+end
+
+local function doTeleport()
+	print("[DoorTP] Arrancando…")
+	local _, _, InteriorsM, DoorsM = waitForBootstrap()
+
+	if InteriorsM.set_allow_non_character_teleports then
+		InteriorsM.set_allow_non_character_teleports(true)
+	end
+
+	-- 1) Intento con PUERTA REAL
+	local realDoor = findRealDoor(InteriorsM, 20)
+	if realDoor then
+		local attempts, delay = 0, 0.5
+		while attempts < 3 do
+			attempts += 1
+			local ok = enterViaDoor(DoorsM, realDoor, true)
+			if ok then
+				for _ = 1, 30 do
+					if isAt(InteriorsM, DESTINATION_ID) then
+						print("[DoorTP] ¡Entraste por la PUERTA REAL!")
+						return
+					end
+					task.wait(0.1)
+				end
+			end
+			task.wait(delay); delay = math.min(delay + 0.5, 2)
+		end
+		warn("[DoorTP] La puerta real no terminó de movernos; uso puerta temporal…")
+	end
+
+	-- 2) PUERTA TEMPORAL (sigue siendo flujo Door:enter)
+	local char = LP.Character or LP.CharacterAdded:Wait()
+	local hrp = char:WaitForChild("HumanoidRootPart", 10)
+	local tempDoor = createTempDoor(hrp and hrp.CFrame or CFrame.new())
+
+	local okTemp = enterViaDoor(DoorsM, tempDoor, false) -- sin open para evitar DoorAnimator
+	if okTemp then
+		for _ = 1, 40 do
+			if isAt(InteriorsM, DESTINATION_ID) then
+				print("[DoorTP] ¡Entraste por la PUERTA TEMPORAL!")
+				break
+			end
+			task.wait(0.1)
+		end
+	end
+	task.delay(2, function() if tempDoor and tempDoor.Parent then tempDoor:Destroy() end end)
+
+	if isAt(InteriorsM, DESTINATION_ID) then return end
+
+	-- 3) Último recurso: InteriorsM directamente
+	warn("[DoorTP] Usando InteriorsM.enter_smooth como último recurso…")
+	local opts = { fade_in_length = 0.5, fade_out_length = 0.4, move_camera = true, camera_zoom = 12 }
+	pcall(function() InteriorsM.enter_smooth(DESTINATION_ID, nil, opts) end)
+end
+
+task.defer(doTeleport)
