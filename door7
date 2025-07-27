@@ -1,0 +1,130 @@
+-- DoorTP (insta por puertas con InteriorsM / DoorsM)
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+
+-- ====== AJUSTES ======
+local DEST_ID   = "DebugInterior" -- Interior destino
+local DOOR_NAME = "MainDoor"      -- Puerta preferida dentro de .Doors
+local WAIT_SECS = 12              -- Timeout para que aparezca el interior descargado
+-- =====================
+
+local load = require(RS:WaitForChild("Fsys")).load
+local function safeLoad(name)
+    local ok, mod = pcall(function() return load(name) end)
+    if ok then return mod end
+    return nil
+end
+
+local RouterClient    = safeLoad("RouterClient")
+local StreamingHelper = safeLoad("new:StreamingHelper")
+local InteriorsM      = safeLoad("InteriorsM")
+local DoorsM          = safeLoad("DoorsM")
+
+local function awaitChar()
+    while not LP.Character do
+        LP:GetPropertyChangedSignal("Character"):Wait()
+    end
+    return LP.Character
+end
+
+local function ensureInterior(folderName, itemName)
+    local interiors = workspace:FindFirstChild("Interiors")
+    if interiors and interiors:FindFirstChild(itemName) then return true end
+
+    if RouterClient then
+        local ok, resp = pcall(function()
+            return RouterClient.get("DownloadsAPI/Download"):InvokeServer(folderName, itemName)
+        end)
+        if ok and resp then
+            if resp.download_model_id and StreamingHelper then
+                pcall(function() StreamingHelper.await(resp.download_model_id) end)
+            end
+            if resp.received_remote_event then
+                pcall(function() resp.received_remote_event:FireServer() end)
+            end
+        end
+    end
+
+    interiors = workspace:WaitForChild("Interiors", 5)
+    if not interiors then return false end
+    local t0 = os.clock()
+    while os.clock() - t0 < WAIT_SECS do
+        if interiors:FindFirstChild(itemName) then return true end
+        task.wait(0.2)
+    end
+    return interiors:FindFirstChild(itemName) ~= nil
+end
+
+local function findDoorTo(destId)
+    if not ensureInterior("Interiors", destId) then return nil end
+
+    local interiors = workspace:FindFirstChild("Interiors")
+    if not interiors then return nil end
+
+    -- Intento directo: Interiors/<destId>/Doors/<DOOR_NAME>
+    local mdl = interiors:FindFirstChild(destId)
+    if mdl and mdl:FindFirstChild("Doors") then
+        local door = mdl.Doors:FindFirstChild(DOOR_NAME) or mdl.Doors:FindFirstChildWhichIsA("Model")
+        if door then return door end
+    end
+
+    -- Fallback: buscar por Configuration.destination_id == destId
+    for _, inter in ipairs(interiors:GetChildren()) do
+        local Doors = inter:FindFirstChild("Doors")
+        if Doors then
+            for _, d in ipairs(Doors:GetChildren()) do
+                local cfg = d:FindFirstChild("WorkingParts") and d.WorkingParts:FindFirstChild("Configuration")
+                local destVal = cfg and cfg:FindFirstChild("destination_id")
+                if destVal and destVal.Value == destId then
+                    return d
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function tpViaDoors(destId)
+    awaitChar()
+
+    if InteriorsM and InteriorsM.set_allow_non_character_teleports then
+        pcall(function() InteriorsM.set_allow_non_character_teleports(true) end)
+    end
+
+    -- Opción 1: usar la API propia (la más limpia y rápida)
+    if InteriorsM and InteriorsM.enter_smooth then
+        local opts = {
+            start_transparency = 1,
+            fade_in_length     = 0.05,
+            fade_out_length    = 0.05,
+            anchor_char_immediately = true,
+            do_not_center      = true,
+        }
+        local doorModel = findDoorTo(destId)
+        local doorId = DOOR_NAME
+        if not doorModel then
+            doorId = nil -- que InteriorsM resuelva
+        end
+        pcall(function()
+            InteriorsM.enter_smooth(destId, doorId, opts)
+        end)
+        return
+    end
+
+    -- Opción 2 (fallback): entrar con DoorsM
+    local doorModel = findDoorTo(destId)
+    if not doorModel or not DoorsM or not DoorsM.get_door then return end
+
+    local DoorObj = DoorsM.get_door(doorModel)
+    pcall(function() DoorObj:visually_open() end)
+    pcall(function()
+        DoorObj:enter({ is_exit_button = false })
+    end)
+end
+
+-- Ejecutar automáticamente
+task.defer(function()
+    tpViaDoors(DEST_ID)
+end)
