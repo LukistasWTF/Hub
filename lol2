@@ -1,0 +1,59 @@
+-- LocalScript - StarterPlayerScripts
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+-- Usa tu cargador
+local load = require(ReplicatedStorage:WaitForChild("Fsys")).load
+
+-- NOMBRES DE TUS MÓDULOS (ajusta si en tu Fsys tienen otro alias)
+local DOWNLOADS_MODULE = "DownloadsM"   -- tu módulo del bloque que pusiste para Downloads
+local INTERIORS_MODULE = "InteriorsM"   -- EXACTO al que pasaste
+
+-- Parámetros exactos que pediste
+local FOLDER = "Interiors"
+local ITEM   = "Cave"
+local DESTINATION_ID = "Cave"
+
+-- Carga de módulos (tal cual, sin modificar tus implementaciones)
+local Downloads = load(DOWNLOADS_MODULE)
+local Interiors = load(INTERIORS_MODULE)
+
+-- (Opcional) log del evento de descargado
+pcall(function()
+	Downloads.get_downloaded_signal():Connect(function(elapsed, folder, item, params)
+		print(("[Downloads] %s/%s listo en %.2fs"):format(folder, item, elapsed))
+	end)
+end)
+
+-- Espera a que exista el Character
+local lp = Players.LocalPlayer
+if not lp.Character then lp.CharacterAdded:Wait() end
+
+-- 1) DESCARGA: usa tu módulo de Downloads con los args que diste (sin params extra)
+local ok, res = pcall(function()
+	return Downloads.download(FOLDER, ITEM) -- params = nil (no se tocan tus asserts)
+end)
+if not ok then
+	warn("[Downloads] Error:", res)
+	return
+end
+
+-- 2) ENTRAR AL INTERIOR: usa tu InteriorsM (NO remotos directos)
+--    Firma en tu código: enter_smooth(arg1, arg2, arg3, ...)
+--    Aquí arg1 = destino, arg2 = nil, arg3 = opciones (puedes dejarlo vacío)
+local options = {
+	anchor_char_immediately = true,
+	-- Si quieres, añade:
+	-- spawn_cframe  = CFrame.new(0, 6, 0),
+	-- camera_cframe = CFrame.new(Vector3.new(0, 7, -8), Vector3.new(0, 4, 0)),
+	-- camera_zoom   = 12,
+}
+Interiors.enter_smooth(DESTINATION_ID, nil, options)
+
+-- 3) (Opcional) liberar del caché tras un rato (tu módulo ya maneja TTL, esto solo fuerza tras 25s)
+task.delay(25, function()
+	pcall(function()
+		Downloads.release(FOLDER, ITEM)
+	end)
+end)
