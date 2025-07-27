@@ -1,0 +1,141 @@
+-- Teleport_DebugInterior.client.lua
+-- 1) Intenta entrar por PUERTA real hacia "DebugInterior"
+-- 2) Si no existe, usa el flujo del cliente con InteriorsM.enter_smooth (sin remotes ofuscados)
+-- 3) (Opcional) Descarga del paquete con tu módulo de Downloads (sin PAJBA…)
+-- Ejecuta el TP inmediatamente.
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+
+local Fsys = RS:WaitForChild("Fsys")
+local load = require(Fsys).load
+
+-- ======== CONFIGURA AQUÍ ========
+local DESTINATION_ID = "DebugInterior"     -- Interior destino
+local SUB_DEST_ID    = "MainDoor"           -- door_id dentro del interior (si aplica)
+-- Si quieres forzar un spawn concreto (como en tu ejemplo), ponlo aquí:
+local FORCE_SPAWN_CFRAME -- = CFrame.new(-275.9091, 25.81208, -1548.1457) * CFrame.Angles(math.pi, 0.201224118, -math.pi)
+-- =================================
+
+-- Utilidades
+local function safeLoad(name, timeout)
+	timeout = timeout or 30
+	local t0 = os.clock()
+	while os.clock() - t0 < timeout do
+		local ok, mod = pcall(load, name)
+		if ok and mod then return mod end
+		task.wait(0.2)
+	end
+	error(("[DoorTP] No pude cargar '%s' a tiempo"):format(name))
+end
+
+local function getHRP()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	return ch:WaitForChild("HumanoidRootPart", 10)
+end
+
+-- (1) Intenta localizar una puerta real hacia DESTINATION_ID
+local function findRealDoorTo(dest)
+	for _, area in ipairs(workspace:WaitForChild("Interiors"):GetChildren()) do
+		if area:FindFirstChild("Doors") then
+			for _, d in ipairs(area.Doors:GetChildren()) do
+				local ok = pcall(function()
+					return d.WorkingParts.Configuration.destination_id.Value == dest
+				end)
+				if ok then return d end
+			end
+		end
+	end
+	return nil
+end
+
+-- (2) Entra por puerta usando DoorsM
+local function enterViaDoor(doorModel)
+	local DoorsM = safeLoad("DoorsM")
+	-- init es idempotente; por si aún no lo llamaron
+	pcall(function() if DoorsM.init then DoorsM.init() end end)
+	local door = DoorsM.get_door(doorModel)
+	-- si la puerta tiene animación, que se abra visualmente
+	pcall(function() door:open() end)
+	door:enter({
+		-- Si tu puerta real no tuviera bien configurado el destino, descomenta:
+		-- override_destination_id = DESTINATION_ID,
+		-- override_door_id = SUB_DEST_ID,
+	})
+end
+
+-- (3) Flujo “cliente” sin remotes ofuscados: InteriorsM.enter_smooth
+local function enterWithInteriorsM(spawnCF)
+	local InteriorsM = safeLoad("InteriorsM")
+	if InteriorsM.set_allow_non_character_teleports then
+		InteriorsM.set_allow_non_character_teleports(true)
+	end
+
+	local opts = {
+		start_transparency = 1,
+		-- Si entregas spawn_cframe, hace TP directo al CFrame dado (como en tu ejemplo)
+		spawn_cframe = spawnCF,
+		-- extras seguros:
+		move_camera = true,
+		camera_zoom = 12,
+		fade_in_length  = 0.0, -- lo dejamos en 0 para que sea lo más “instantáneo” posible
+		fade_out_length = 0.0,
+	}
+
+	-- Esto reemplaza al FireServer MqBDIRhbTn/…  (usa RouterClient internamente)
+	InteriorsM.enter_smooth(DESTINATION_ID, SUB_DEST_ID, opts)
+end
+
+-- (4) (Opcional) descarga previa del paquete usando TU módulo de Downloads (sin PAJBA…)
+-- Descomenta si lo deseas. Debes poner el nombre correcto del módulo si lo guardaste con otro id.
+--[[ 
+local Downloads = safeLoad("Downloads") -- o el nombre con el que pegaste ese módulo
+task.spawn(function()
+	-- Ejemplo: "Interiors", "MainMap!Summerfest" -> ajusta a lo que necesites para DebugInterior
+	-- Downloads.download("Interiors", "MainMap!DebugInterior")
+	-- Downloads.release("Interiors", "MainMap!DebugInterior")
+end)
+]]
+
+-- ====== EJECUCIÓN INMEDIATA ======
+task.defer(function()
+	print("[DoorTP] Iniciando…")
+
+	-- 1) Si existe una puerta real hacia DebugInterior, úsala.
+	local realDoor = findRealDoorTo(DESTINATION_ID)
+	if realDoor then
+		print("[DoorTP] Usando PUERTA real hacia '"..DESTINATION_ID.."'…")
+		local ok, err = pcall(enterViaDoor, realDoor)
+		if not ok then warn("[DoorTP] Falló enterViaDoor:", err) end
+		return
+	end
+
+	-- 2) Si NO hay puerta, usamos InteriorsM.enter_smooth con los mismos args del cliente.
+	print(("[DoorTP] No encontré una puerta hacia '%s'. ¿Existe en workspace.Interiors?"):format(DESTINATION_ID))
+
+	-- Si no diste FORCE_SPAWN_CFRAME, intentamos sacar uno “razonable”:
+	local spawnCF = FORCE_SPAWN_CFRAME
+	if not spawnCF then
+		-- Si existe el modelo del interior en el Workspace (descargado), intenta usar su MainDoor
+		local area = workspace:FindFirstChild("Interiors") and workspace.Interiors:FindFirstChild(DESTINATION_ID)
+		if area and area:FindFirstChild("Doors") and area.Doors:FindFirstChild("MainDoor") then
+			local t = area.Doors.MainDoor.WorkingParts:FindFirstChild("TouchToEnter")
+			if t then
+				-- un poco detrás de la puerta, mirando hacia adentro
+				spawnCF = t.CFrame * CFrame.new(0, 0, -4)
+			end
+		end
+		-- Fallback: delante del jugador
+		if not spawnCF then
+			local hrp = getHRP()
+			spawnCF = hrp and (hrp.CFrame + hrp.CFrame.LookVector * 4) or CFrame.new(0, 10, 0)
+		end
+	end
+
+	print("[DoorTP] Entrando con InteriorsM.enter_smooth…")
+	local ok, err = pcall(enterWithInteriorsM, spawnCF)
+	if not ok then
+		warn("[DoorTP] InteriorsM.enter_smooth falló:", err)
+	end
+end)
