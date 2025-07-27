@@ -1,0 +1,153 @@
+-- DoorTP_DebugInterior (insta por puertas, sin require a "Downloads")
+
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+
+-- ====== AJUSTES ======
+local DEST_ID   = "DebugInterior" -- interior al que ir
+local DOOR_NAME = "MainDoor"      -- nombre de la puerta dentro de .Doors
+local WAIT_SECS = 12              -- timeout para que aparezca el interior
+-- =====================
+
+-- Fsys loader seguro (no rompe si el target no es ModuleScript)
+local load = require(RS:WaitForChild("Fsys")).load
+local function safeLoad(name)
+    local ok, mod = pcall(function() return load(name) end)
+    if ok then return mod end
+    return nil
+end
+
+-- Módulos (todos ModuleScript reales)
+local RouterClient      = safeLoad("RouterClient")
+local StreamingHelper   = safeLoad("new:StreamingHelper")  -- para await(id)
+local InteriorsM        = safeLoad("InteriorsM")
+local DoorsM            = safeLoad("DoorsM")
+
+-- Esperar personaje
+local function awaitChar()
+    while not LP.Character do
+        LP:GetPropertyChangedSignal("Character"):Wait()
+    end
+    return LP.Character
+end
+
+-- Pide al servidor el pack y espera que aparezca en workspace.Interiors
+local function ensureInterior(folderName, itemName)
+    -- 1) ya está cargado
+    local interiors = workspace:FindFirstChild("Interiors")
+    if interiors and interiors:FindFirstChild(itemName) then return true end
+
+    -- 2) solicitar descarga via RouterClient (reemplaza a "Downloads")
+    if RouterClient then
+        local ok, res = pcall(function()
+            return RouterClient.get("DownloadsAPI/Download"):InvokeServer(folderName, itemName)
+        end)
+        if ok and res then
+            -- si el server envía un id de streaming, lo esperamos sin requerir nada
+            if res.download_model_id and StreamingHelper then
+                pcall(function() StreamingHelper.await(res.download_model_id) end)
+            end
+            -- algunos juegos piden confirmar recepción:
+            if res.received_remote_event then
+                pcall(function() res.received_remote_event:FireServer() end)
+            end
+        end
+    end
+
+    -- 3) esperar a que realmente aparezca el interior en el mundo
+    interiors = workspace:WaitForChild("Interiors", 5)
+    if not interiors then return false end
+    local t0 = os.clock()
+    while os.clock() - t0 < WAIT_SECS do
+        if interiors:FindFirstChild(itemName) then return true end
+        task.wait(0.2)
+    end
+    return interiors:FindFirstChild(itemName) ~= nil
+end
+
+-- Busca una puerta que lleve a DEST_ID (preferencia por Doors.MainDoor)
+local function findDoorTo(destId)
+    -- asegurar que está descargado/renderizado
+    if not ensureInterior("Interiors", destId) then return nil end
+
+    local interiors = workspace:FindFirstChild("Interiors")
+    if not interiors then return nil end
+
+    -- A) intento directo por convención: Interiors/<destId>/Doors/<DOOR_NAME>
+    local mdl = interiors:FindFirstChild(destId)
+    if mdl and mdl:FindFirstChild("Doors") then
+        local door = mdl.Doors:FindFirstChild(DOOR_NAME) or mdl.Doors:FindFirstChildWhichIsA("Model")
+        if door then return door end
+    end
+
+    -- B) fallback: recorre todas las puertas buscando Configuration.destination_id == destId
+    for _, inter in ipairs(interiors:GetChildren()) do
+        local Doors = inter:FindFirstChild("Doors")
+        if Doors then
+            for _, d in ipairs(Doors:GetChildren()) do
+                local cfg = d:FindFirstChild("WorkingParts") and d.WorkingParts:FindFirstChild("Configuration")
+                local destVal = cfg and cfg:FindFirstChild("destination_id")
+                if destVal and destVal.Value == destId then
+                    return d
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- TP “insta” usando el sistema real de puertas (sin tocar CFrame manualmente)
+local function tpViaDoors(destId)
+    awaitChar()
+
+    -- Permitir teleports sin bloquear si el char aún no existe (tu InteriorsM lo soporta)
+    if InteriorsM and InteriorsM.set_allow_non_character_teleports then
+        pcall(function() InteriorsM.set_allow_non_character_teleports(true) end)
+    end
+
+    -- Si existe la API de “enter_smooth”, es lo más rápido/limpio
+    if InteriorsM and InteriorsM.enter_smooth then
+        -- Opciones rápidas: sin centrado, anclaje inmediato y fades casi nulos
+        local opts = {
+            start_transparency = 1,
+            fade_in_length     = 0.05,
+            fade_out_length    = 0.05,
+            anchor_char_immediately = true,
+            do_not_center      = true,
+        }
+        -- Si existe la puerta, úsala como segundo argumento; si no, deja nil.
+        local doorModel = findDoorTo(destId)
+        local doorId = DOOR_NAME
+        if not doorModel then
+            -- sin puerta encontrada, InteriorsM se las apaña con el destino
+            doorId = nil
+        end
+        -- Llamada directa: InteriorsM ya manda el AdoptAPI/SendPassiveDoorEnter al server
+        pcall(function()
+            InteriorsM.enter_smooth(destId, doorId, opts)
+        end)
+        return
+    end
+
+    -- Fallback: usando DoorsM.Door:enter() sobre la puerta encontrada
+    local doorModel = findDoorTo(destId)
+    if not doorModel or not DoorsM or not DoorsM.get_door then
+        return -- no hay forma segura de hacerlo por puertas sin esos módulos
+    end
+
+    local DoorObj = DoorsM.get_door(doorModel)
+    -- abrir visualmente para que el sistema haga arrive/teleport
+    pcall(function() DoorObj:visually_open() end)
+    pcall(function()
+        DoorObj:enter({
+            is_exit_button = false,
+            -- studs_ahead_of_door = 0, -- opcional
+        })
+    end)
+end
+
+-- Ejecutar automáticamente al cargar
+task.defer(function()
+    tpViaDoors(DEST_ID)
+end)
