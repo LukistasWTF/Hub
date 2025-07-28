@@ -1,0 +1,368 @@
+-- v10 – Línea 1 SIN llamadas (no puede romper aquí)
+local __L1_SAFE__ = true
+
+-- ⚠️ TODO el trabajo se hace dentro de este arranque protegido.
+task.spawn(function()
+	local ok_boot, err_boot = pcall(function()
+
+		---------------------------------------------------------------------
+		-- 🧩 Servicios / base
+		---------------------------------------------------------------------
+		local Players     = game:GetService("Players")
+		local RS          = game:GetService("ReplicatedStorage")
+		local RunService  = game:GetService("RunService")
+		local LP          = Players.LocalPlayer
+		if not RunService:IsClient() or not LP then return end
+
+		---------------------------------------------------------------------
+		-- 📝 Logs
+		---------------------------------------------------------------------
+		local function LOG(tag, ...) print(string.format("%s %s", tag, os.date("!%H:%M:%S")), ...) end
+		local function logI(...) LOG("🟢 [AutoMG]", ...) end
+		local function logW(...) LOG("⚠️  [AutoMG]", ...) end
+		local function logS(...) LOG("✅ [AutoMG]", ...) end
+
+		logI("Arrancando v10 (boot diferido y protegido)…")
+
+		---------------------------------------------------------------------
+		-- 📦 Fsys (exacto) y loader de módulos
+		--    SE CARGA AQUÍ DENTRO (no en línea 1) para evitar cualquier choque.
+		---------------------------------------------------------------------
+		local Fsys
+		do
+			local ok, mod = pcall(function()
+				return require(RS:WaitForChild("Fsys"))
+			end)
+			if ok and type(mod)=="table" and type(mod.load)=="function" then
+				Fsys = mod.load
+				logS("Fsys.load listo (cargado en boot).")
+			else
+				logW("Fsys no disponible o sin .load; usaré búsqueda plana de respaldo.")
+				Fsys = nil
+			end
+		end
+
+		local function loadM(name)
+			-- 1) Fsys si existe
+			if Fsys then
+				local ok, m = pcall(function() return Fsys(name) end)
+				if ok and m ~= nil then
+					logI("Módulo via Fsys:", name)
+					return m
+				end
+				logW("Fsys no devolvió módulo para:", name)
+			end
+			-- 2) Búsqueda exacta en RS
+			for _,d in ipairs(RS:GetDescendants()) do
+				if d:IsA("ModuleScript") and d.Name == name then
+					local ok2, got = pcall(require, d)
+					if ok2 and got ~= nil then
+						logI("Módulo por búsqueda:", name, "←", d:GetFullName())
+						return got
+					end
+				end
+			end
+			logW("No se pudo cargar módulo:", name)
+			return nil
+		end
+
+		local LiveOpsTime           = loadM("LiveOpsTime")           or { now=function() return os.clock() end }
+		local MinigameClientManager = loadM("MinigameClientManager") -- puede ser nil; se re‑intenta
+		local ClientData            = loadM("ClientData")            -- opcional
+
+		---------------------------------------------------------------------
+		-- ⚙️ Config
+		---------------------------------------------------------------------
+		local CONFIG = {
+			autoEnabled           = true,
+			statusRefresh         = 1.0,   -- s
+			defaultQueueCountdown = 12,    -- s
+			inProgressGrace       = 5,     -- s
+
+			coords = {
+				joetation    = Vector3.new(-590.8, 35.8, -1667.1),
+				coconut_bonk = Vector3.new(-600.3, 41.6, -1610.3),
+			},
+
+			sendJoinMessageAfterTP = false, -- no forzamos join
+
+			-- Cadencia adaptativa
+			actionCadence = { joetation = 0.85, coconut_bonk = 0.80 },
+			minCadence = 0.45, maxCadence = 2.00, stepDown = 0.06, stepUp = 0.10,
+
+			-- Cobertura por tick
+			joetation = { triesPerAct = 5, fallbackMaxIdx = 14 },
+			coconut   = { pilesToCycle = 5, usesPerAct = 5 },
+
+			-- Burst cuando queda poco
+			burstThreshold = 7,   -- s
+			burstMultiplier = 2,
+
+			enableAFK  = true,
+			verboseRPC = true,
+		}
+
+		---------------------------------------------------------------------
+		-- 🧰 Utils
+		---------------------------------------------------------------------
+		local function nowS() return LiveOpsTime.now() end
+		local function srvNow()
+			if typeof(workspace.GetServerTimeNow) == "function" then return workspace:GetServerTimeNow() end
+			return nowS()
+		end
+		local function hrp() local c=LP.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+		local function fmtTime(s) s=math.max(0,math.floor(s)); return string.format("%02d:%02d", math.floor(s/60), s%60) end
+
+		---------------------------------------------------------------------
+		-- ✈️ TP seguro
+		---------------------------------------------------------------------
+		local function getRoot()
+			local char = LP.Character or LP.CharacterAdded:Wait()
+			return char:WaitForChild("HumanoidRootPart"), char:WaitForChild("Humanoid")
+		end
+		local function tpTo(v3)
+			if typeof(v3)~="Vector3" then return end
+			local root, hum = getRoot(); if not root or not hum then return end
+			if workspace.StreamingEnabled and typeof(LP.RequestStreamAroundAsync)=="function" then
+				pcall(function() LP:RequestStreamAroundAsync(v3, 128) end)
+			end
+			local oldState; pcall(function() oldState=hum:GetState(); hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+			local look=(root.CFrame*CFrame.new(0,0,-1)).Position
+			root.CFrame=CFrame.new(v3+Vector3.new(0,3,0), look)
+			task.delay(0.12, function()
+				if hum and hum.Parent then pcall(function() if oldState then hum:ChangeState(oldState) end end) end
+			end)
+		end
+
+		---------------------------------------------------------------------
+		-- 🛰️ Estado / ETA
+		---------------------------------------------------------------------
+		local function refreshMgr()
+			if not MinigameClientManager then MinigameClientManager = loadM("MinigameClientManager") end
+			return MinigameClientManager
+		end
+		local function getClient(id)
+			if not refreshMgr() or typeof(MinigameClientManager.get)~="function" then return nil end
+			local ok, cli = pcall(function() return MinigameClientManager.get(id) end)
+			return ok and cli or nil
+		end
+		local function readStatus(cli)
+			local st={active=false,loading=false,inQueue=false,timeLeft=nil,raw=nil}
+			local ms=cli and cli.minigame_state
+			local now=srvNow()
+			if ms then
+				local get=(typeof(ms.get)=="function") and function(k) local ok,v=pcall(function() return ms:get(k) end); return ok and v or nil end or function() return nil end
+				st.active  = get("is_game_active") or false
+				st.loading = get("players_loading") or false
+				if typeof(ms.get_as_table)=="function" then
+					local t; pcall(function() t=ms:get_as_table("queued_user_ids") end)
+					if type(t)=="table" then for _,uid in ipairs(t) do if uid==LP.UserId then st.inQueue=true break end end end
+				end
+				local zts=get("zone_override_timestamp")
+				if typeof(zts)=="number" and zts>0 then st.timeLeft=math.max(0,math.floor(zts-now)); st.raw="zone_override_timestamp" end
+			end
+			if cli and cli.is_participating and cli.end_time then st.active=true; st.timeLeft=math.max(0,math.floor(cli.end_time-now)); st.raw=st.raw or "client.end_time" end
+			if (not st.timeLeft) and ClientData and cli and cli.cycle_timestamp_key and typeof(ClientData.get)=="function" then
+				pcall(function()
+					local rec=ClientData.get(cli.cycle_timestamp_key)
+					local ts=rec and (rec.timestamp or rec.t or rec.next_timestamp)
+					if ts then st.timeLeft=math.max(0,math.floor(ts-now)); st.raw="ClientData.cycle_timestamp" end
+				end)
+			end
+			return st
+		end
+		local function etaToStart(cli, st)
+			if st.active then return (st.timeLeft or CONFIG.defaultQueueCountdown)+CONFIG.inProgressGrace, false, st.raw end
+			if st.loading then return 5, true, "players_loading" end
+			if st.timeLeft and st.timeLeft>0 then return st.timeLeft, true, st.raw end
+			return CONFIG.defaultQueueCountdown, true, "fallback"
+		end
+		local function statusAndEta(id)
+			local cli=getClient(id); if not cli then return nil end
+			local st=readStatus(cli); local eta,joinable,raw=etaToStart(cli,st)
+			return { id=id, cli=cli, st=st, eta=eta, joinable=joinable, raw=raw }
+		end
+		local ORDER={"joetation","coconut_bonk"}
+		local function pickBest()
+			local best,bestEta
+			for _,id in ipairs(ORDER) do
+				local r=statusAndEta(id)
+				if r then
+					logI(string.format("📡 ETA %-13s → ⏱ %s (%s) active=%s inQueue=%s",
+						id, fmtTime(r.eta), r.raw or "fallback", tostring(r.st.active), tostring(r.st.inQueue)))
+					if r.eta < (bestEta or math.huge) then best,bestEta=id,r.eta end
+				else logW("📡 ETA "..id.." → sin datos") end
+			end
+			return best or "joetation"
+		end
+
+		---------------------------------------------------------------------
+		-- 🎯 Autoplay (round‑robin + adaptativo + burst)
+		---------------------------------------------------------------------
+		local dynCad, lastAct = {}, {}
+		for k,v in pairs(CONFIG.actionCadence) do dynCad[k]=v end
+		local function canAct(id)
+			local cad=dynCad[id] or 1.0
+			local t=nowS()
+			if not lastAct[id] or (t-lastAct[id])>=cad then lastAct[id]=t; return true end
+			return false
+		end
+		local function tuneCad(id, ok, burst)
+			local cad=dynCad[id] or 1.0
+			if ok then cad=math.max(CONFIG.minCadence, cad-CONFIG.stepDown*(burst and 1.5 or 1))
+			else cad=math.min(CONFIG.maxCadence, cad+CONFIG.stepUp) end
+			dynCad[id]=cad
+			logI(string.format("⏲️ Cadencia %-13s → %.2fs (ok=%s, burst=%s)", id, cad, tostring(ok), tostring(burst)))
+		end
+		local function rpc(cli, route, ...)
+			if not cli or typeof(cli.message_server)~="function" then return false end
+			local ok, err = pcall(function() return cli:message_server(route, ...) end)
+			if not ok and CONFIG.verboseRPC then logW("📨 RPC FAIL:", route, err) end
+			return ok
+		end
+
+		-- cursores RR
+		local cannonCursor, shipCursor, pileIdx = 1,1,1
+		local function cannonList(cli)
+			local arr = {}
+			local ok, list = pcall(function() return cli.cannons_world end); list = ok and list or nil
+			if type(list)=="table" and #list>0 then for i=1,#list do arr[#arr+1]=i end
+			else for i=1,CONFIG.joetation.fallbackMaxIdx do arr[#arr+1]=i end end
+			return arr
+		end
+		local function shipUidList(cli)
+			local arr = {}
+			local ok, map = pcall(function() return cli.ships_by_uid end); map = ok and map or nil
+			if type(map)=="table" then for uid,_ in pairs(map) do arr[#arr+1]=uid end end
+			return arr
+		end
+
+		local function act_joetation(cli, r)
+			if not canAct("joetation") then return end
+			local tleft = r and r.st and r.st.timeLeft or nil
+			local burst = (tleft and tleft <= CONFIG.burstThreshold)
+			local root=hrp(); local pos=root and root.Position or Vector3.new()
+
+			rpc(cli, "pickup_holdable_from_pile", pos, nowS()); logI("🎒 [joetation] pickup_holdable_from_pile")
+
+			local list=cannonList(cli)
+			local tries = CONFIG.joetation.triesPerAct * (burst and CONFIG.burstMultiplier or 1)
+			local okAny=false
+			for n=1, math.max(1, tries) do
+				if #list==0 then break end
+				local idx=list[cannonCursor]; cannonCursor=(cannonCursor % #list)+1
+				local ok=rpc(cli, "use_cannon", idx, pos, nowS())
+				logI(string.format("💥 [joetation] %s %d/%d → cannon=%d → ok=%s",
+					burst and "[BURST]" or "intento", n, tries, idx, tostring(ok)))
+				okAny = okAny or ok
+			end
+			if not okAny then logW("💤 [joetation] sin disparo exitoso este tick") end
+			tuneCad("joetation", okAny, burst)
+		end
+
+		local function act_coconut(cli, r)
+			if not canAct("coconut_bonk") then return end
+			local tleft = r and r.st and r.st.timeLeft or nil
+			local burst = (tleft and tleft <= CONFIG.burstThreshold)
+
+			rpc(cli, "pickup_droppable", pileIdx)
+			logI(string.format("🎒 [coconut] pickup_droppable → pile=%d%s", pileIdx, burst and " [BURST]" or ""))
+			pileIdx = (pileIdx % CONFIG.coconut.pilesToCycle) + 1
+
+			local uids=shipUidList(cli); if #uids==0 then logW("🛶 [coconut] ships_by_uid vacío"); tuneCad("coconut_bonk", false, burst); return end
+			local uses = CONFIG.coconut.usesPerAct * (burst and CONFIG.burstMultiplier or 1)
+			local okAny=false
+			for n=1, math.max(1, uses) do
+				if shipCursor>#uids then shipCursor=1 end
+				local uid=uids[shipCursor]; shipCursor = shipCursor + 1
+				local ok=rpc(cli, "used_droppable", uid)
+				logI(string.format("🔧 [coconut] %s %d/%d → uid=%s → ok=%s",
+					burst and "[BURST]" or "intento", n, uses, tostring(uid), tostring(ok)))
+				okAny = okAny or ok
+			end
+			if not okAny then logW("💤 [coconut] sin uso exitoso este tick") end
+			tuneCad("coconut_bonk", okAny, burst)
+		end
+
+		---------------------------------------------------------------------
+		-- 💤 Anti‑AFK
+		---------------------------------------------------------------------
+		if CONFIG.enableAFK then
+			LP.Idled:Connect(function()
+				local vu = game:GetService("VirtualUser")
+				vu:CaptureController(); vu:ClickButton2(Vector2.new())
+				logI("🖱️ Anti‑AFK: click simulado.")
+			end)
+		end
+
+		---------------------------------------------------------------------
+		-- 💬 Comandos por chat (opcional)
+		---------------------------------------------------------------------
+		local function parseVec3(sx,sy,sz)
+			local x = tonumber((sx or ""):gsub(",", ".")) or 0
+			local y = tonumber((sy or ""):gsub(",", ".")) or 0
+			local z = tonumber((sz or ""):gsub(",", ".")) or 0
+			return Vector3.new(x,y,z)
+		end
+		LP.Chatted:Connect(function(msg)
+			msg = msg or ""
+			local args = {}; for w in msg:gmatch("%S+") do args[#args+1]=w end
+			if args[1]=="/auto" and args[2] then
+				if args[2]:lower()=="on" then logS("🟢 AUTO ON"); CONFIG.autoEnabled=true
+				elseif args[2]:lower()=="off" then logS("🔴 AUTO OFF"); CONFIG.autoEnabled=false end
+			elseif args[1]=="/coords" and args[2] and args[3] and args[4] and args[5] then
+				local id=args[2]
+				if CONFIG.coords[id] then CONFIG.coords[id]=parseVec3(args[3],args[4],args[5]); local v=CONFIG.coords[id]
+					logS(string.format("📍 %s = (%.1f, %.1f, %.1f)", id, v.X, v.Y, v.Z))
+				else logW("Uso: /coords joetation|coconut_bonk X Y Z") end
+			elseif args[1]=="/tp" and args[2] and CONFIG.coords[args[2]] then
+				tpTo(CONFIG.coords[args[2]]); logS("🧭 TP manual → "..args[2])
+			end
+		end)
+
+		---------------------------------------------------------------------
+		-- 🔁 Bucle principal
+		---------------------------------------------------------------------
+		task.spawn(function()
+			logI("✨ Listo. AUTO =", CONFIG.autoEnabled and "ON" or "OFF")
+			local currentPlaying
+			while true do
+				if CONFIG.autoEnabled then
+					local anyPlaying, playingId = false, nil
+					for _, id in ipairs({"joetation","coconut_bonk"}) do
+						local r = statusAndEta(id)
+						if r and r.cli and r.cli.is_participating then anyPlaying=true; playingId=id end
+					end
+					if not anyPlaying then
+						local best = pickBest()
+						if currentPlaying ~= nil then logS("🏁 Partida anterior finalizada.") end
+						currentPlaying = nil
+						local target = CONFIG.coords[best] or CONFIG.coords.joetation
+						logI(string.format("🧭 TP → %-13s @ (%.1f, %.1f, %.1f)", best, target.X, target.Y, target.Z))
+						tpTo(target)
+						if CONFIG.sendJoinMessageAfterTP then
+							local r=statusAndEta(best); if r and r.cli then pcall(function() r.cli:message_server("join_queue") end) end
+							logI("📨 join_queue (opcional) enviado.")
+						end
+						task.wait(2)
+					else
+						if currentPlaying ~= playingId then currentPlaying=playingId; cannonCursor,shipCursor,pileIdx=1,1,1; logS("🎮 Entraste a "..currentPlaying.." (FULL)") end
+						local r=statusAndEta(currentPlaying)
+						if r and r.cli and r.cli.is_participating then
+							if currentPlaying=="joetation" then act_joetation(r.cli, r) else act_coconut(r.cli, r) end
+						end
+						task.wait(0.1)
+					end
+				else
+					task.wait(0.25)
+				end
+				task.wait(CONFIG.statusRefresh)
+			end
+		end)
+
+	end) -- pcall boot
+
+	if not ok_boot then
+		warn("🛑 [AutoMG v10] Boot error protegido:", err_boot)
+	end
+end) -- task.spawn
