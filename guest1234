@@ -1,0 +1,395 @@
+-- AutoQueueTP v1.0 – Smart Queue + Teleport por coordenadas + Auto‑play
+-- by ChatGPT (adaptado a tu flujo y coordenadas)
+
+--==================== Servicios / Guardas ====================
+local RunService          = game:GetService("RunService")
+if not RunService:IsClient() then warn("[AutoQueueTP] Debe ser LocalScript."); return end
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local StarterGui          = game:GetService("StarterGui")
+local PathfindingService  = game:GetService("PathfindingService")
+local VirtualUser         = game:GetService("VirtualUser")
+local LocalPlayer         = Players.LocalPlayer
+
+local function toast(msg, dur) pcall(function()
+	StarterGui:SetCore("SendNotification", {Title="AutoQueueTP", Text=msg, Duration=dur or 2})
+end) end
+
+--==================== Carga segura de módulos ====================
+local function isMS(x) return typeof(x)=="Instance" and x:IsA("ModuleScript") end
+local function srequire(ms) if not isMS(ms) then return nil end local ok,r=pcall(function() return require(ms) end); return ok and r or nil end
+
+local FsysMS = ReplicatedStorage:FindFirstChild("Fsys")
+local Fsys   = srequire(FsysMS)
+local FSYS_LOAD = (Fsys and type(Fsys.load)=="function") and Fsys.load or nil
+local function loadM(name)
+	if FSYS_LOAD then local ok,mod=pcall(function() return FSYS_LOAD(name) end); if ok and mod then return mod end end
+	for _,root in ipairs({"ClientModules","SharedModules"}) do
+		local f = ReplicatedStorage:FindFirstChild(root, true)
+		if f then local m=f:FindFirstChild(name, true); local got=srequire(m); if got then return got end end
+	end
+	return nil
+end
+
+--==================== Módulos del juego (si existen) ====================
+local MinigameClientManager = loadM("MinigameClientManager")
+local RouterClient          = loadM("RouterClient")
+local ClientData            = loadM("ClientData")
+local ClientToolManager     = loadM("ClientToolManager")
+local LiveOpsTime           = loadM("LiveOpsTime") or { now=function() return os.clock() end }
+
+--==================== Config ====================
+local CONFIG = {
+	-- Tus spots:
+	teleportCoords = {
+		coconut_bonk = Vector3.new(-600.3, 41.6, -1610.3),
+		joetation    = Vector3.new(-590.8, 35.8, -1667.1),
+	},
+
+	-- ¿Mostrar UI?
+	useUI = true,          -- si lo pones en false, hace todo automático
+	rememberLast = true,   -- recuerda el último spot en la UI
+	uiPosition = UDim2.new(0, 10, 0, 60),
+
+	-- Qué minijuegos y orden de prioridad si hay empate
+	games = { "joetation", "coconut_bonk" },
+
+	-- Polling/colas
+	statusRefresh = 1.0,
+	defaultQueueCountdown = 12,
+	inProgressGrace = 5,
+
+	-- Teleport
+	useRouter = true,                               -- intenta Router (si está disponible)
+	routerRoute = "AdoptAPI/SendPassiveDoorEnter",  -- ruta típica
+	routerTimeout = 6.0,                            -- s
+	yOffset = 3,                                    -- elevar un poco al hacer CFrame TP
+
+	-- Auto‑play simple (no intrusivo)
+	autoPlay = true,
+	joetationCadence = 1.25,
+	coconutCadence  = 1.50,
+
+	-- Anti‑AFK
+	antiAFK = true,
+}
+
+--==================== Helpers ====================
+local function now() return LiveOpsTime and LiveOpsTime.now() or os.clock() end
+local function hrp()
+	local c=LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	return c:FindFirstChild("HumanoidRootPart")
+end
+local function humanoid()
+	local c=LocalPlayer.Character
+	return c and c:FindFirstChildWhichIsA("Humanoid")
+end
+local function serverNow()
+	if workspace.GetServerTimeNow then return workspace:GetServerTimeNow() end
+	return now()
+end
+local function getClient(id)
+	if not MiniggameClientManager and MinigameClientManager == nil then
+		MinigameClientManager = loadM("MinigameClientManager")
+	end
+	if not MinigameClientManager then return nil end
+	local ok, cli = pcall(function() return MinigameClientManager.get(id) end)
+	return ok and cli or nil
+end
+
+--==================== Lectura de estado / ETA ====================
+local function readStatus(cli)
+	local st = { active=false, loading=false, inQueue=false, timeLeft=nil, raw=nil }
+	local ms = cli and cli.minigame_state
+	local nowS = serverNow()
+
+	if ms then
+		local get = (type(ms.get)=="function") and function(k) local ok,v=pcall(function() return ms:get(k) end); return ok and v or nil end or function() return nil end
+		st.active  = get("is_game_active") or false
+		st.loading = get("players_loading") or false
+		if type(ms.get_as_table)=="function" then
+			local t=nil; pcall(function() t=ms:get_as_table("queued_user_ids") end)
+			if type(t)=="table" then for _,uid in ipairs(t) do if uid==LocalPlayer.UserId then st.inQueue=true break end end end
+		end
+		local zts = get("zone_override_timestamp")
+		if typeof(zts)=="number" and zts>0 then st.timeLeft = math.max(0, math.floor(zts - nowS)); st.raw="zone_override_timestamp" end
+	end
+	if cli and cli.is_participating and cli.end_time then
+		st.active = true; st.timeLeft = math.max(0, math.floor(cli.end_time - nowS)); st.raw = st.raw or "client.end_time"
+	end
+	if (not st.timeLeft) and ClientData and cli and cli.cycle_timestamp_key then
+		pcall(function()
+			local rec = ClientData.get(cli.cycle_timestamp_key)
+			local ts = rec and (rec.timestamp or rec.t or rec.next_timestamp)
+			if ts then st.timeLeft = math.max(0, math.floor(ts - nowS)); st.raw = "ClientData.cycle_timestamp" end
+		end)
+	end
+	return st
+end
+local function estimateSecondsToStart(cli, st)
+	if st.active then return (st.timeLeft or CONFIG.defaultQueueCountdown)+CONFIG.inProgressGrace, false, st.raw end
+	if st.loading then return 5, true, "players_loading" end
+	if st.timeLeft and st.timeLeft>0 then return st.timeLeft, true, st.raw end
+	return CONFIG.defaultQueueCountdown, true, "fallback"
+end
+
+--==================== Teleport ====================
+local function tpViaRouter(dest, door, spawnCF)
+	if not (CONFIG.useRouter and RouterClient and type(RouterClient.get)=="function") then return false end
+	local remote
+	local okg,r = pcall(function() return RouterClient.get(CONFIG.routerRoute) end)
+	if okg and r and r.FireServer then remote = r end
+	if not remote then return false end
+
+	local settings = { start_transparency = 1, spawn_cframe = spawnCF }
+	local ok = pcall(function() remote:FireServer(dest or "MainMap", door or "MainDoor", settings) end)
+	if not ok then return false end
+
+	local t0 = tick()
+	repeat task.wait(0.1) until (tick()-t0)>CONFIG.routerTimeout or (hrp() and spawnCF and (hrp().Position - spawnCF.Position).Magnitude<12)
+	return hrp() and spawnCF and (hrp().Position - spawnCF.Position).Magnitude<12
+end
+
+local function tpByCoords(v3)
+	local root = hrp()
+	if not root then return false end
+	local target = v3 + Vector3.new(0, CONFIG.yOffset, 0)
+	local hum = humanoid()
+	local oldState = hum and hum:GetState()
+	if hum then hum:ChangeState(Enum.HumanoidStateType.Physics) end
+	root.CFrame = CFrame.new(target, (root.CFrame * CFrame.new(0,0,-1)).Position)
+	task.delay(0.1, function() if hum and hum.Parent then hum:ChangeState(oldState) end end)
+	return true
+end
+
+local function teleportToGameSpot(id)
+	local v = CONFIG.teleportCoords[id]
+	if not v then return false end
+	-- 1) intenta Router a ese spawn (si existe TeleportLocations con ese nombre)
+	local spawnCF = CFrame.new(v)
+	if tpViaRouter("MainMap","MainDoor",spawnCF) then
+		toast("Teletransportado (Router) → "..id)
+		return true
+	end
+	-- 2) CFrame directo
+	if tpByCoords(v) then
+		toast("Teletransportado (CFrame) → "..id)
+		return true
+	end
+	return false
+end
+
+--==================== Colas ====================
+local function attemptJoin(id, st)
+	local cli = getClient(id); if not cli then return false end
+	if st.inQueue then return true end
+	if st.active then return false end
+	teleportToGameSpot(id)
+	local ok=false
+	if cli.join_persistent_game then ok=pcall(function() cli:join_persistent_game() end) end
+	if (not ok) and cli.message_server then ok=pcall(function() cli:message_server("join_queue") end) end
+	if ok then toast("Entré a la cola de "..id) end
+	return ok
+end
+
+local function readStatusAndEta(id)
+	local cli = getClient(id); if not cli then return nil end
+	local st = readStatus(cli)
+	local eta, joinable, raw = estimateSecondsToStart(cli, st)
+	return { cli=cli, st=st, eta=eta, joinable=joinable, raw=raw }
+end
+
+local function pickBestQueue()
+	local bestId, bestEta, bestJoinable
+	for _, id in ipairs(CONFIG.games) do
+		local r = readStatusAndEta(id)
+		if r and r.eta < (bestEta or math.huge) then
+			bestId, bestEta, bestJoinable = id, r.eta, r.joinable
+		end
+	end
+	return bestId, bestEta, bestJoinable
+end
+
+--==================== Auto‑play muy simple ====================
+local lastShot, lastBonk = 0, 0
+local function act_joetation(cli)
+	if not CONFIG.autoPlay then return end
+	if now() - lastShot < CONFIG.joetationCadence then return end
+	lastShot = now()
+	local pos = hrp() and hrp().Position or Vector3.new()
+	-- coger item + disparar al cañón más cercano si hay
+	pcall(function() cli:message_server("pickup_holdable_from_pile", pos, (ClientToolManager.now and ClientToolManager.now() or now())) end)
+	local idx = 1
+	if cli.cannons_world and #cli.cannons_world>0 and pos then
+		local bestD
+		for i,p in ipairs(cli.cannons_world) do local d=(p-pos).Magnitude; if not bestD or d<bestD then bestD,idx=d,i end end
+	end
+	pcall(function() cli:message_server("use_cannon", idx, pos, (ClientToolManager.now and ClientToolManager.now() or now())) end)
+end
+local function act_coconut(cli)
+	if not CONFIG.autoPlay then return end
+	if now() - lastBonk < CONFIG.coconutCadence then return end
+	lastBonk = now()
+	pcall(function() cli:message_server("pickup_droppable", 1) end)
+	local me = hrp() and hrp().Position or Vector3.new()
+	local bestUid, bestScore = nil, -1
+	if cli.ships_by_uid then
+		for uid, ship in pairs(cli.ships_by_uid) do
+			local hp, p = 1, nil
+			pcall(function()
+				if ship.ship_data and ship.ship_data.health then hp = ship.ship_data.health end
+				if ship.base and ship.base.PrimaryPart then p = ship.base.PrimaryPart.Position end
+			end)
+			local dist = p and (p-me).Magnitude or 1000
+			local score = hp - dist*0.02
+			if score>bestScore then bestScore, bestUid = score, uid end
+		end
+	end
+	if bestUid then pcall(function() cli:message_server("used_droppable", bestUid) end) end
+end
+
+local function tryClaimRewards(id, cli)
+	local routes = { "claim_rewards","collect_rewards","request_rewards","request_reward_payout","claim_payout","claim_xp" }
+	for _, r in ipairs(routes) do if pcall(function() return cli:message_server(r) end) then break end end
+end
+
+--==================== Bucle principal ====================
+local currentGame, queuedGameId, playing = nil, nil, {}
+local mgEndsAt = {}
+
+local function onGameStarted(id, cli)
+	playing[id], currentGame = true, id
+	local left = cli and cli.end_time and math.max(0, math.floor(cli.end_time - serverNow())) or nil
+	if left then mgEndsAt[id] = serverNow() + left end
+	toast("¡Partida iniciada! → "..id.." ("..(left or 0).."s)", 2.5)
+end
+local function onGameEnded(id, cli)
+	playing[id] = false; if currentGame==id then currentGame=nil end; mgEndsAt[id]=nil
+	tryClaimRewards(id, cli)
+	queuedGameId = nil
+	toast("Fin de partida en "..id..". Buscando nueva cola…", 2.5)
+end
+
+task.spawn(function()
+	toast("AutoQueueTP listo. "..(CONFIG.useUI and "UI ON" or "Modo automático"), 2.5)
+	while true do
+		-- 1) si no estamos jugando ni ya encolados, elegir cola y entrar
+		if not currentGame and not queuedGameId then
+			local bestId, eta, joinable = pickBestQueue()
+			if bestId and joinable then
+				local r = readStatusAndEta(bestId)
+				if r and attemptJoin(bestId, r.st) then queuedGameId = bestId end
+			else
+				task.wait(math.max(CONFIG.statusRefresh, (eta or 2)))
+			end
+		end
+
+		-- 2) si estamos en una cola, vigilar inicio
+		if queuedGameId and not currentGame then
+			local r = readStatusAndEta(queuedGameId)
+			if r then
+				if r.st.active then local cli=getClient(queuedGameId); if cli then onGameStarted(queuedGameId, cli) end end
+				task.wait(CONFIG.statusRefresh)
+			else
+				task.wait(CONFIG.statusRefresh)
+			end
+		end
+
+		-- 3) si estamos jugando, actuar
+		for _, id in ipairs(CONFIG.games) do
+			local cli = getClient(id)
+			if cli and cli.is_participating then
+				if currentGame ~= id or not playing[id] then onGameStarted(id, cli) end
+				if id=="joetation" then act_joetation(cli)
+				elseif id=="coconut_bonk" then act_coconut(cli)
+				end
+			end
+			if cli and (not cli.is_participating) and playing[id] then onGameEnded(id, cli) end
+		end
+
+		task.wait(0.05)
+	end
+end)
+
+--==================== Anti‑AFK ====================
+if CONFIG.antiAFK then
+	LocalPlayer.Idled:Connect(function()
+		VirtualUser:CaptureController(); VirtualUser:ClickButton2(Vector2.new())
+	end)
+end
+
+--==================== UI opcional ====================
+if CONFIG.useUI then
+	local player = LocalPlayer
+	local gui = Instance.new("ScreenGui")
+	gui.Name="TPGui"; gui.ResetOnSpawn=false; gui.IgnoreGuiInset=true; gui.Parent = player:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.new(0, 300, 0, 190)
+	frame.Position = CONFIG.uiPosition
+	frame.BackgroundTransparency = 0.2
+	frame.BackgroundColor3 = Color3.fromRGB(0,0,0)
+	frame.Parent = gui
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0,10)
+
+	local function makeBox(name, placeholder, x, y)
+		local box = Instance.new("TextBox")
+		box.Name = name; box.PlaceholderText = placeholder
+		box.Size = UDim2.new(0, 85, 0, 34); box.Position = UDim2.new(0, x, 0, y)
+		box.ClearTextOnFocus=false; box.BackgroundColor3 = Color3.fromRGB(25,25,25)
+		box.TextColor3 = Color3.fromRGB(255,255,255); box.Font = Enum.Font.Gotham; box.TextScaled=true; box.Parent = frame
+		return box
+	end
+
+	local xBox = makeBox("XBox","X",10,10)
+	local yBox = makeBox("YBox","Y",105,10)
+	local zBox = makeBox("ZBox","Z",200,10)
+
+	local info = Instance.new("TextLabel")
+	info.Size = UDim2.new(0, 280, 0, 22); info.Position = UDim2.new(0,10,0,48)
+	info.BackgroundTransparency=1; info.TextColor3=Color3.fromRGB(255,255,255)
+	info.Font=Enum.Font.Gotham; info.TextScaled=true; info.Text="Introduce X,Y,Z o usa los atajos ↓"; info.Parent = frame
+
+	local function parseNum(str) if not str then return nil end str=tostring(str):gsub(",", "."); return tonumber(str) end
+
+	local tpBtn = Instance.new("TextButton")
+	tpBtn.Name="TeleportButton"; tpBtn.Text="Teleport"
+	tpBtn.Size=UDim2.new(0, 280, 0, 34); tpBtn.Position=UDim2.new(0,10,0,74)
+	tpBtn.BackgroundColor3=Color3.fromRGB(40,120,40); tpBtn.TextColor3=Color3.fromRGB(255,255,255)
+	tpBtn.Font=Enum.Font.GothamBold; tpBtn.TextScaled=true; tpBtn.Parent=frame
+
+	local function quickBtn(label, id, x)
+		local b = Instance.new("TextButton")
+		b.Size=UDim2.new(0, 130, 0, 32); b.Position=UDim2.new(0, x, 0, 114)
+		b.BackgroundColor3=Color3.fromRGB(45,45,45); b.TextColor3=Color3.fromRGB(255,255,255)
+		b.Font=Enum.Font.Gotham; b.TextScaled=true; b.Text=label; b.Parent=frame
+		b.MouseButton1Click:Connect(function()
+			local v = CONFIG.teleportCoords[id]
+			if v then
+				xBox.Text=string.format("%.1f", v.X); yBox.Text=string.format("%.1f", v.Y); zBox.Text=string.format("%.1f", v.Z)
+				tpByCoords(v); info.Text="TP a "..id
+			end
+		end)
+	end
+	quickBtn("joetation","joetation",10)
+	quickBtn("coconut_bonk","coconut_bonk",160)
+
+	local autoBtn = Instance.new("TextButton")
+	autoBtn.Size=UDim2.new(0, 280, 0, 32); autoBtn.Position=UDim2.new(0,10,0,150)
+	autoBtn.BackgroundColor3=Color3.fromRGB(70,70,120); autoBtn.TextColor3=Color3.fromRGB(255,255,255)
+	autoBtn.Font=Enum.Font.GothamBold; autoBtn.TextScaled=true; autoBtn.Text="Auto‑cola: ON"; autoBtn.Parent=frame
+	local autoOn = true
+
+	autoBtn.MouseButton1Click:Connect(function()
+		autoOn = not autoOn
+		autoBtn.Text = "Auto‑cola: "..(autoOn and "ON" or "OFF")
+		CONFIG.autoPlay = autoOn
+	end)
+
+	tpBtn.MouseButton1Click:Connect(function()
+		local x = parseNum(xBox.Text); local y = parseNum(yBox.Text); local z = parseNum(zBox.Text)
+		if not (x and y and z) then info.Text="⚠️ Coordenadas inválidas."; return end
+		if tpByCoords(Vector3.new(x,y,z)) then info.Text=string.format("TP a %.1f, %.1f, %.1f", x,y,z) end
+	end)
+end
