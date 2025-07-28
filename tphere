@@ -1,0 +1,104 @@
+-- LocalScript: UI para teletransporte por coordenadas
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Crear UI
+local gui = Instance.new("ScreenGui")
+gui.Name = "TPGui"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 300, 0, 140)
+frame.Position = UDim2.new(0, 10, 0, 60)
+frame.BackgroundTransparency = 0.2
+frame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+frame.Parent = gui
+
+local function makeBox(name, placeholder, x, y)
+	local box = Instance.new("TextBox")
+	box.Name = name
+	box.PlaceholderText = placeholder
+	box.Size = UDim2.new(0, 85, 0, 34)
+	box.Position = UDim2.new(0, x, 0, y)
+	box.ClearTextOnFocus = false
+	box.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+	box.TextColor3 = Color3.fromRGB(255, 255, 255)
+	box.Font = Enum.Font.Gotham
+	box.TextScaled = true
+	box.Parent = frame
+	return box
+end
+
+local xBox = makeBox("XBox", "X", 10, 10)
+local yBox = makeBox("YBox", "Y", 105, 10)
+local zBox = makeBox("ZBox", "Z", 200, 10)
+
+local btn = Instance.new("TextButton")
+btn.Name = "TeleportButton"
+btn.Text = "Teleport"
+btn.Size = UDim2.new(0, 280, 0, 36)
+btn.Position = UDim2.new(0, 10, 0, 60)
+btn.BackgroundColor3 = Color3.fromRGB(40, 120, 40)
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Font = Enum.Font.GothamBold
+btn.TextScaled = true
+btn.Parent = frame
+
+local info = Instance.new("TextLabel")
+info.Size = UDim2.new(0, 280, 0, 24)
+info.Position = UDim2.new(0, 10, 0, 100)
+info.BackgroundTransparency = 1
+info.TextColor3 = Color3.fromRGB(255, 255, 255)
+info.Font = Enum.Font.Gotham
+info.TextScaled = true
+info.Text = "Introduce X, Y, Z y pulsa Teleport"
+info.Parent = frame
+
+local function parseNum(str)
+	if not str then return nil end
+	str = tostring(str)
+	-- admite comas decimales
+	str = str:gsub(",", ".")
+	return tonumber(str)
+end
+
+local function getRoot()
+	local char = player.Character or player.CharacterAdded:Wait()
+	return char:WaitForChild("HumanoidRootPart"), char:WaitForChild("Humanoid")
+end
+
+btn.MouseButton1Click:Connect(function()
+	local x = parseNum(xBox.Text)
+	local y = parseNum(yBox.Text)
+	local z = parseNum(zBox.Text)
+
+	if not (x and y and z) then
+		info.Text = "⚠️ Coordenadas inválidas."
+		return
+	end
+
+	local root, hum = getRoot()
+	if not root then
+		info.Text = "⚠️ No se encontró el personaje."
+		return
+	end
+
+	-- Pequeño offset arriba para evitar quedar atascado en el suelo
+	local target = Vector3.new(x, y, z) + Vector3.new(0, 3, 0)
+
+	-- (Opcional) desactivar momentáneamente la física para evitar empujes raros
+	local oldState = hum:GetState()
+	hum:ChangeState(Enum.HumanoidStateType.Physics)
+
+	root.CFrame = CFrame.new(target, (root.CFrame * CFrame.new(0, 0, -1)).Position)
+
+	task.delay(0.1, function()
+		-- restaurar control
+		if hum and hum.Parent then
+			hum:ChangeState(oldState)
+		end
+	end)
+
+	info.Text = string.format("Teletransportado a: %.1f, %.1f, %.1f", x, y, z)
+end)
