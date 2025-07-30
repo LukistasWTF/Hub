@@ -1,0 +1,263 @@
+local __L1_OK__ = true
+
+-- ===== servicios básicos =====
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+if not LP then return end
+
+-- ===== logs =====
+local function logI(...) print("🟢[AutoPotions]", ...) end
+local function logW(...) print("⚠️ [AutoPotions]", ...) end
+local function logS(...) print("✅[AutoPotions]", ...) end
+
+-- ===== Fsys (si existe) =====
+local FsysModule = RS:FindFirstChild("Fsys")
+local FsysLoad
+if FsysModule and FsysModule:IsA("ModuleScript") then
+    local ok, mod = pcall(require, FsysModule)
+    if ok and type(mod)=="table" and type(mod.load)=="function" then
+        FsysLoad = mod.load -- función Fsys.load(name)
+        logS("Fsys.load disponible.")
+    else
+        logW("Fsys encontrado pero no tiene .load usable, se usará fallback.")
+    end
+else
+    logW("Fsys no encontrado como ModuleScript, se usará fallback.")
+end
+
+-- ===== helpers de carga robustos =====
+local function srequire(ms)
+    if typeof(ms)=="Instance" and ms:IsA("ModuleScript") then
+        local ok, ret = pcall(require, ms)
+        if ok then return ret end
+    end
+    return nil
+end
+
+-- Busca un ModuleScript por ruta tipo "Folder/Sub/Nombre" o sólo por último segmento
+local function findModuleByPath(path)
+    if type(path)~="string" or path=="" then return nil end
+    -- intento 1: navegar segmentos desde RS
+    local root = RS
+    local found = nil
+    local segs = {}
+    for seg in string.gmatch(path, "[^/]+") do segs[#segs+1]=seg end
+    if #segs>0 then
+        found = root
+        for i=1,#segs do
+            found = found and found:FindFirstChild(segs[i])
+        end
+        if found and found:IsA("ModuleScript") then return found end
+    end
+    -- intento 2: buscar por último nombre en todo RS
+    local last = segs[#segs] or path
+    for _,d in ipairs(RS:GetDescendants()) do
+        if d:IsA("ModuleScript") and d.Name == last then
+            return d
+        end
+    end
+    return nil
+end
+
+-- Cargador unificado: intenta Fsys.load; si falla, fallback a búsqueda
+local function loadM(name)
+    -- evitar alias que suelen romper (ej: "new:StreamingHelper")
+    if string.find(name, "new:") == 1 then
+        logW("Ignorando alias especial no requerido:", name)
+        return nil
+    end
+
+    -- 1) Fsys.load
+    if FsysLoad then
+        local ok, ret = pcall(function() return FsysLoad(name) end)
+        if ok and ret ~= nil then
+            logI("Módulo via Fsys:", name)
+            return ret
+        end
+        -- si falló porque intentó require un LocalScript/Folde etc, seguimos al fallback
+        logW("Fsys.load no pudo cargar '"..name.."', usando fallback.")
+    end
+
+    -- 2) Fallback: encontrar ModuleScript en RS
+    local ms = findModuleByPath(name)
+    if ms then
+        local got = srequire(ms)
+        if got ~= nil then
+            logI("Módulo por búsqueda:", name, "←", ms:GetFullName())
+            return got
+        end
+    end
+
+    logW("No se pudo cargar el módulo:", name)
+    return nil
+end
+
+-- ===== módulos que necesitamos =====
+local ClientData            = loadM("ClientData")                -- inventario
+local RouterClient          = loadM("RouterClient")
+local InventoryDB           = loadM("InventoryDB")               -- definición de foods/pets
+local PetPotionEffectsDB    = loadM("PetPotionEffectsDB")        -- identifica qué food es póc.
+local PetObjectCreatorType  = loadM("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+-- NOTA: NO cargamos "new:StreamingHelper" para evitar el error
+
+-- comprobar mínimos
+if not (ClientData and RouterClient and InventoryDB and PetPotionEffectsDB and PetObjectCreatorType) then
+    logW("Faltan módulos necesarios. Aborto seguro.")
+    return
+end
+
+-- ===== helpers Router =====
+local function RC(route)
+    local r = RouterClient.get and RouterClient.get(route)
+    if not r then logW("Route no encontrada:", route) end
+    return r
+end
+local function invoke(route, ...)
+    local r = RC(route); if not r or not r.InvokeServer then return false, "route nil" end
+    local ok, res = pcall(r.InvokeServer, r, ...)
+    if not ok then return false, tostring(res) end
+    return true, res
+end
+
+-- ===== inventario =====
+local function getInventorySafe()
+    local ok, inv = pcall(function() return ClientData.get("inventory") end)
+    return (ok and inv) or {}
+end
+
+-- recoge todas las pociones (food con efecto de poción)
+local function collectPotionStacks(inv)
+    local stacksByKind = {}
+    local function push(e)
+        if not e or not e.id or not e.unique then return end
+        local potionDef = PetPotionEffectsDB[e.id]
+        if not potionDef then return end
+        local fdef = InventoryDB.food[e.id]
+        local kind = (fdef and fdef.kind) or e.kind or e.id
+        stacksByKind[kind] = stacksByKind[kind] or {}
+        table.insert(stacksByKind[kind], { id=e.id, unique=e.unique, kind=kind })
+    end
+    if type(inv.food)=="table" then
+        for _,entry in pairs(inv.food) do push(entry) end
+    end
+    -- fallback por si hay otra estructura
+    for _,cat in pairs(inv) do
+        if type(cat)=="table" then
+            for _,entry in pairs(cat) do
+                if entry and entry.id and InventoryDB.food[entry.id] and PetPotionEffectsDB[entry.id] then
+                    push(entry)
+                end
+            end
+        end
+    end
+    return stacksByKind
+end
+
+-- lista de todas las pets
+local function collectPets(inv)
+    local pets = {}
+    local function push(e)
+        if not e then return end
+        local unique = e.unique or e.pet_unique
+        local id     = e.id or e.pet_id
+        if not unique or not id then return end
+        if InventoryDB.pets[id] then
+            table.insert(pets, { unique=unique, id=id })
+        end
+    end
+    if type(inv.pets)=="table" then
+        for _,p in pairs(inv.pets) do push(p) end
+    end
+    -- fallback
+    for _,cat in pairs(inv) do
+        if type(cat)=="table" then
+            for _,entry in pairs(cat) do
+                if entry and (entry.pet_unique or (entry.id and InventoryDB.pets[entry.id])) then
+                    push(entry)
+                end
+            end
+        end
+    end
+    return pets
+end
+
+-- consume una poción para una pet
+local function feedOnce(pet_unique, baseUnique)
+    local payload = {
+        unique_id  = baseUnique,
+        pet_unique = pet_unique,
+        additional_consume_uniques = {}, -- 1 a 1 para máxima compatibilidad
+    }
+    local ok, res = invoke("PetObjectAPI/CreatePetObject", PetObjectCreatorType.PetFood, payload)
+    if not ok then
+        logW("CreatePetObject falló:", tostring(res))
+        return false
+    end
+    return true
+end
+
+-- aplica todas las de un kind a una pet (el servidor corta cuando ya no deja más)
+local function maxFeedKindForPet(petEntry, stacks)
+    local pdef = InventoryDB.pets[petEntry.id] or {}
+    if pdef.is_egg then
+        logW("Saltada (egg):", petEntry.unique); return 0
+    end
+    if pdef.is_doll then
+        logW("Saltada (doll):", petEntry.unique); return 0
+    end
+    local fed = 0
+    while #stacks > 0 do
+        local base = table.remove(stacks, 1)
+        local ok = feedOnce(petEntry.unique, base.unique)
+        if not ok then
+            table.insert(stacks, 1, base) -- devolver para probar con otra pet
+            break
+        end
+        fed += 1
+        task.wait(0.15)
+    end
+    return fed
+end
+
+-- ===== rutina principal =====
+local function giveMaxPotionsToAllPets()
+    local inv       = getInventorySafe()
+    local pets      = collectPets(inv)
+    local byKind    = collectPotionStacks(inv)
+
+    local totalPets = #pets
+    local totalPot  = 0; for _,lst in pairs(byKind) do totalPot += #lst end
+    if totalPets==0 then logW("No hay mascotas en inventario."); return end
+    if totalPot==0 then logW("No tienes pociones en el inventario."); return end
+
+    local kindCount = 0 for _ in pairs(byKind) do kindCount+=1 end
+    logI(("Mascotas: %d | Póc. totales: %d | Kinds: %d"):format(totalPets, totalPot, kindCount))
+
+    for i,pet in ipairs(pets) do
+        local left = 0 for _,lst in pairs(byKind) do left+=#lst end
+        if left==0 then logI("No quedan pociones, fin."); break end
+
+        logI(("[%d/%d] Pet %s (%s) — aplicando máximas pociones disponibles…")
+            :format(i, totalPets, tostring(pet.unique), tostring(pet.id)))
+
+        for kind, lst in pairs(byKind) do
+            if #lst>0 then
+                local fed = maxFeedKindForPet(pet, lst)
+                if fed>0 then logS(("→ %s: +%d aplicada(s) a %s"):format(kind, fed, pet.unique)) end
+            end
+        end
+        task.wait(0.25)
+    end
+
+    task.wait(0.5)
+    logS("Completado. Si aún ves pociones, ya alcanzaste el tope en algunas pets.")
+end
+
+-- auto‑run + comando por chat
+task.spawn(giveMaxPotionsToAllPets)
+LP.Chatted:Connect(function(msg)
+    if (msg or ""):lower():match("^/maxpot") then
+        task.spawn(giveMaxPotionsToAllPets)
+    end
+end)
