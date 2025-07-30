@@ -1,0 +1,157 @@
+-- LocalScript: Marcar coleccionado "mega_neon" de "frost_dragon"
+-- Cliente únicamente (Roblox)
+-- Comentarios en español y con envoltorios seguros por si hay entornos ensombrecidos.
+
+-- ====== L1 seguro ======
+local _pcall = rawget(_G, "pcall")
+local SAFE_PCALL = (type(_pcall)=="function") and function(fn, ...) return _pcall(fn, ...) end or function(fn, ...) return true, fn(...) end
+local function LOG(tag, ...) print(string.format("%s %s", tag, os.date("!%H:%M:%S")), ...) end
+local function logI(...) LOG("🟢 [CollectFD]", ...) end
+local function logW(...) LOG("⚠️  [CollectFD]", ...) end
+local function logS(...) LOG("✅ [CollectFD]", ...) end
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+if not RunService:IsClient() then logW("No es cliente; abortando."); return end
+local LP = Players.LocalPlayer
+if not LP then logW("No hay LocalPlayer; abortando."); return end
+
+-- ====== Fsys loader ======
+local RS = game:GetService("ReplicatedStorage")
+local Fsys = RS:WaitForChild("Fsys")
+local okLoad, FLOAD = SAFE_PCALL(function() return require(Fsys).load end)
+if not okLoad or type(FLOAD) ~= "function" then
+    logW("No se pudo obtener Fsys.load.")
+    return
+end
+
+-- ====== Módulos necesarios ======
+local ClientData = nil
+local RouterClient = nil
+do
+    local ok1, mod1 = SAFE_PCALL(function() return FLOAD("ClientData") end)
+    local ok2, mod2 = SAFE_PCALL(function() return FLOAD("RouterClient") end)
+    if ok1 then ClientData = mod1 else logW("No se pudo cargar ClientData.") end
+    if ok2 then RouterClient = mod2 else logW("No se pudo cargar RouterClient.") end
+    if not (ClientData and RouterClient) then
+        logW("Faltan módulos base; abortando.")
+        return
+    end
+end
+
+-- ====== Helpers de ClientData (get/set seguros) ======
+local function CD_get(key)
+    local ok, v = SAFE_PCALL(function() return ClientData.get(key) end)
+    if ok then return v end
+    return nil
+end
+
+local function CD_set(key, value)
+    -- Intenta ClientData.set; si no existe, prueba otras variantes comunes.
+    local tried = false
+    if type(ClientData.set) == "function" then
+        tried = true
+        local ok = SAFE_PCALL(function() ClientData.set(key, value) end)
+        if ok then return true end
+    end
+    if type(ClientData.update) == "function" then
+        tried = true
+        local ok = SAFE_PCALL(function() ClientData.update(key, value) end)
+        if ok then return true end
+    end
+    if not tried then
+        logW("ClientData no expone 'set'/'update'.")
+    end
+    return false
+end
+
+-- ====== Commit de la colección vía Router ======
+local function commit_collection()
+    local ok, route = SAFE_PCALL(function() return RouterClient.get("JournalAPI/CommitCollection") end)
+    if ok and route and typeof(route.FireServer) == "function" then
+        local ok2 = SAFE_PCALL(function() route:FireServer() end)
+        if ok2 then
+            logS("CommitCollection enviado al servidor.")
+            return true
+        else
+            logW("Falló FireServer en CommitCollection.")
+        end
+    else
+        logW("No se pudo obtener la ruta JournalAPI/CommitCollection.")
+    end
+    return false
+end
+
+-- ====== Lógica: marcar frost_dragon como coleccionado (+ flag mega) ======
+local CATEGORY = "pets"
+local KIND = "frost_dragon"
+
+local function mark_frost_dragon_mega_collected()
+    -- 1) Leer colección existente o iniciar una.
+    local coll = CD_get("journal_collection")
+    if type(coll) ~= "table" then coll = {} end
+    if type(coll[CATEGORY]) ~= "table" then coll[CATEGORY] = {} end
+
+    -- 2) Marcar esta entrada como recogida en la colección.
+    --    El código de tu juego sólo comprueba verdad/falsedad (presence) para considerar "coleccionado".
+    --    Por compatibilidad máxima, usaremos boolean true.
+    if not coll[CATEGORY][KIND] then
+        coll[CATEGORY][KIND] = true
+        logI("Marcando colección: ", CATEGORY.." → "..KIND.." = true")
+    else
+        logI("Ya estaba marcado: ", CATEGORY.." → "..KIND)
+    end
+
+    -- 3) (Opcional) Guardar una marca auxiliar de mega_neon en otro key de ClientData.
+    --    Esto NO es necesario para que aparezca como coleccionado, pero puede ayudarte a filtrar/mostrar.
+    --    Si tu juego no usa este dato, se ignora sin problema.
+    local metaKey = "journal_pet_flags"
+    local meta = CD_get(metaKey)
+    if type(meta) ~= "table" then meta = {} end
+    if type(meta[KIND]) ~= "table" then meta[KIND] = {} end
+    if meta[KIND].mega_neon ~= true then
+        meta[KIND].mega_neon = true
+        logI("Marcando flag auxiliar mega_neon para ", KIND)
+        CD_set(metaKey, meta) -- si falla, no es crítico
+    end
+
+    -- 4) Persistir los cambios de la colección y hacer commit al servidor.
+    local okSet = CD_set("journal_collection", coll)
+    if not okSet then
+        logW("No pude escribir 'journal_collection' en ClientData. ¿Tu ClientData expone set/update?")
+        return false
+    end
+    return commit_collection()
+end
+
+-- Ejecutar automáticamente al cargar:
+local ok = mark_frost_dragon_mega_collected()
+if ok then
+    logS("Listo: frost_dragon (mega_neon) coleccionado.")
+else
+    logW("No se pudo completar la operación.")
+end
+
+-- Comandos de chat útiles:
+-- /collect_fd        → vuelve a intentar marcar y hacer commit
+-- /uncollect_fd      → elimina la marca de la colección (por si quieres revertir)
+LP.Chatted:Connect(function(msg)
+    msg = (msg or ""):lower()
+    if msg == "/collect_fd" then
+        mark_frost_dragon_mega_collected()
+    elseif msg == "/uncollect_fd" then
+        local coll = CD_get("journal_collection") or {}
+        if coll[CATEGORY] and coll[CATEGORY][KIND] then
+            coll[CATEGORY][KIND] = nil
+            if next(coll[CATEGORY]) == nil then coll[CATEGORY] = nil end
+            if CD_set("journal_collection", coll) then
+                commit_collection()
+                logS("Revertido: se desmarcó "..KIND.." de la colección.")
+            else
+                logW("No se pudo escribir la reversión en ClientData.")
+            end
+        else
+            logI("No estaba coleccionado; nada que revertir.")
+        end
+    end
+end)
