@@ -1,0 +1,162 @@
+-- AutoMaxPotions.fallback.local.lua
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+repeat task.wait() until game:IsLoaded()
+
+-- ---------- FSYS (opcional, con diagnóstico)
+local load
+do
+    local ok, mod = pcall(function()
+        local fsysInst = ReplicatedStorage:WaitForChild("Fsys", 5)
+        if not fsysInst then error("No existe ReplicatedStorage.Fsys") end
+        -- Si tu Fsys tiene submódulo Client/Init, priorízalo:
+        if fsysInst:IsA("Folder") then
+            fsysInst = fsysInst:FindFirstChild("Client") or fsysInst:FindFirstChild("Init") or fsysInst
+        end
+        local r = require(fsysInst)
+        return r.load or r -- algunos exponen load directo
+    end)
+    if ok and type(mod) == "function" then
+        load = function(name)
+            local ok2, result = pcall(mod, name)
+            if not ok2 then
+                warn(("[AutoMaxPotions] Fsys no pudo cargar '%s': %s"):format(name, tostring(result)))
+                return nil
+            end
+            return result
+        end
+    else
+        warn("[AutoMaxPotions] No se pudo inicializar Fsys: ", mod)
+        load = nil
+    end
+end
+
+-- ---------- Dependencias (solo si Fsys funcionó)
+local ClientData, RouterClient, PetObjectCreatorType
+if load then
+    ClientData = load("ClientData")
+    RouterClient = load("RouterClient")
+    PetObjectCreatorType = load("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+end
+
+-- ---------- Fallbacks
+-- Remote hashed (tu RF original): ReplicatedStorage.API.sHXuHQMLdmBwoshVSmYKaqMajfew
+local API = ReplicatedStorage:WaitForChild("API", 5)
+local RF_CreatePetObject = API and API:FindFirstChild("sHXuHQMLdmBwoshVSmYKaqMajfew")
+
+-- Función unificada para crear objetos de mascota (alimentar poción)
+local function createPetObject_petFood(payload)
+    -- 1) RouterClient si está disponible
+    if RouterClient and PetObjectCreatorType then
+        local rf = RouterClient.get("PetObjectAPI/CreatePetObject")
+        return rf:InvokeServer(PetObjectCreatorType.PetFood, payload)
+    end
+
+    -- 2) Fallback a RemoteFunction con el sentinel string del enum
+    if RF_CreatePetObject and RF_CreatePetObject:IsA("RemoteFunction") then
+        -- Tu servidor aceptaba "__Enum_PetObjectCreatorType_2" para PetFood
+        return RF_CreatePetObject:InvokeServer("__Enum_PetObjectCreatorType_2", payload)
+    end
+
+    error("No hay forma de invocar CreatePetObject (ni RouterClient ni RF hash).")
+end
+
+-- ---------- Lectura de inventario/pets con fallback
+local function getInventory()
+    if ClientData then
+        local inv = ClientData.get("inventory")
+        if inv then return inv end
+    end
+    -- Si no hay ClientData, último recurso: intenta un ValueObject publicado por ti
+    -- (déjalo aquí por si ya lo expones. Si no, agrega uno en tu juego).
+    local invVO = ReplicatedStorage:FindFirstChild("ClientInventory")
+    if invVO and invVO:IsA("ModuleScript") then
+        local ok, mod = pcall(require, invVO)
+        if ok then return mod end
+    end
+    error("Inventario no disponible en cliente. Asegura 'ClientData' accesible por Fsys.")
+end
+
+-- ---------- Lógica mínima (sin DBs) -> prueba a aplicar pociones hasta que el server corte
+local DELAY = 0.2
+local RUN_ON_JOIN = true
+local INCLUDE_EGGS = false
+
+local running = false
+
+local function isEggOrDoll(petEntry)
+    -- Sin InventoryDB; inferimos por flags comunes si vienen en el entry.
+    return petEntry and (petEntry.is_egg or petEntry.is_doll or (petEntry.properties and (petEntry.properties.is_egg or petEntry.properties.is_doll))) or false
+end
+
+local function autoMaxAllPets()
+    if running then return end
+    running = true
+
+    local inv = getInventory()
+    local food = inv and inv.food or {}
+    local pets = inv and inv.pets or {}
+
+    if not next(food) then
+        warn("[AutoMaxPotions] No hay pociones en inventario.")
+        running = false
+        return
+    end
+    if not next(pets) then
+        warn("[AutoMaxPotions] No hay mascotas en inventario.")
+        running = false
+        return
+    end
+
+    -- Recorre mascotas y pociones (sin DBs: deja que el servidor valide límites)
+    for pet_unique, petEntry in pairs(pets) do
+        if not running then break end
+        if INCLUDE_EGGS or not isEggOrDoll(petEntry) then
+            for idx, item in pairs(food) do
+                if not running then break end
+                -- Solo intenta con lo que parezca poción: muchos juegos etiquetan id o kind con "potion"
+                local isPotion = (item and (tostring(item.id):find("potion") or tostring(item.kind):find("potion")))
+                if isPotion then
+                    local payload = {
+                        unique_id  = item.unique,
+                        pet_unique = pet_unique,
+                        additional_consume_uniques = {},
+                        spawn_cframe = nil
+                    }
+                    local ok = pcall(createPetObject_petFood, payload)
+                    if ok then
+                        -- Quítalo localmente para no reintentar (si tienes ClientData, puedes predecir consumo)
+                        food[idx] = nil
+                    else
+                        -- Rechazado → seguramente alcanzó límite; continúa
+                    end
+                    task.wait(DELAY)
+                end
+            end
+        end
+        task.wait(DELAY)
+    end
+
+    running = false
+    print("[AutoMaxPotions] Terminado.")
+end
+
+-- Lanzar al entrar
+if RUN_ON_JOIN then
+    LocalPlayer.CharacterAdded:Wait()
+    task.defer(autoMaxAllPets)
+end
+
+-- Comandos de chat
+LocalPlayer.Chatted:Connect(function(msg)
+    msg = string.lower(msg or "")
+    if msg == "/maxpotions" then
+        autoMaxAllPets()
+    elseif msg == "/stopmax" then
+        running = false
+        warn("[AutoMaxPotions] Cancelado por el usuario.")
+    end
+end)
