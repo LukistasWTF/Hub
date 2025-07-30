@@ -1,0 +1,724 @@
+--====================================================================--
+--  Bucks Transfer + Intercept + Anti‑AFK ▌ STABLE v16 (multi‑tabs)
+--    • FIX: setState durante montaje (Changed/Ref) → task.defer + _mounted
+--    • 4 pestañas independientes (Instance 1–4) con envíos paralelos
+--    • Anti‑AFK global compartido
+--    • Intercept dirigido por pestaña (one‑shot por defecto)
+--====================================================================--
+
+------------------------------  CONSTANTES (SEMILLA – se pueden cambiar en la UI)
+local CHUNK_SIZE  = 149
+local MAX_OP      = 50
+local DEF_FIRST_SUB_INTERVAL = 9
+local DEF_SUB_INTERVAL       = 9
+local DEF_COOLDOWN_SEC       = 95
+-----------------------------------------------------------------------
+
+------------------------------  SERVICIOS / MÓDULOS
+local RS           = game:GetService("ReplicatedStorage")
+local Players      = game:GetService("Players")
+local LP           = Players.LocalPlayer
+local VU           = game:GetService("VirtualUser")      -- Anti‑AFK
+local Fsys         = require(RS:WaitForChild("Fsys"))
+local Roact        = Fsys.load("Roact")
+local RouterClient = Fsys.load("RouterClient")
+
+------------------------------  INTERCEPT EVENT (compartido)
+local interceptEv = RS:FindFirstChild("BucksInterceptEvent") or Instance.new("BindableEvent", RS)
+interceptEv.Name = "BucksInterceptEvent"
+
+------------------------------  RUTAS A ESPIAR
+local WATCH = {
+    ["HousingAPI/ActivateFurniture"]         = true,
+    ["HousingAPI/ActivateInteriorFurniture"] = true,
+}
+local pathByInstance = {}
+do
+    local _get = RouterClient.get
+    RouterClient.get = function(route, ...)
+        local inst = _get(route, ...)
+        if WATCH[route] then pathByInstance[inst] = route end
+        return inst
+    end
+    for route in pairs(WATCH) do
+        pathByInstance[_get(route)] = route
+    end
+end
+
+------------------------------  HELPERS
+local function getPos(io)
+    local p = io.Position
+    if typeof(p) == "Vector3" then return Vector2.new(p.X, p.Y)
+    elseif typeof(p) == "Vector2" then return p
+    else return Vector2.zero end
+end
+
+local function formatTime(sec)
+    if sec <= 0 then return "0s" end
+    local h = math.floor(sec/3600)
+    local m = math.floor((sec%3600)/60)
+    local s = sec%60
+    local t = {}
+    if h>0 then table.insert(t,h.."h") end
+    if m>0 then table.insert(t,m.."m") end
+    if s>0 or #t==0 then table.insert(t,s.."s") end
+    return table.concat(t," ")
+end
+
+local function safeNumber(txt,def)
+    local n = tonumber(txt)
+    return (n and n>=0) and n or def
+end
+
+local function calcEta(amount, FIRST_SUB_INTERVAL, SUB_INTERVAL, COOLDOWN_SEC)
+    local amt = tonumber(amount)
+    if not amt or amt<=0 then return 0 end
+    local cycles = math.ceil(amt / CHUNK_SIZE)
+    local eta = 0
+    for i=1,cycles do
+        local cs  = (i<cycles) and CHUNK_SIZE or (amt - CHUNK_SIZE*(cycles-1))
+        local ops = math.ceil(cs / MAX_OP)
+        eta += (ops-1) * ((i==1) and FIRST_SUB_INTERVAL or SUB_INTERVAL)
+        if i<cycles then eta += COOLDOWN_SEC end
+    end
+    return eta
+end
+
+------------------------------  HOOK __namecall (igual que siempre)
+if not rawget(_G,"__BUCKS_HOOK") then
+    local mt = getrawmetatable(game); setreadonly(mt,false)
+    local oldNamecall = mt.__namecall
+    mt.__namecall = function(self,...)
+        local method = getnamecallmethod()
+        local route  = pathByInstance[self]
+        if route and (method=="InvokeServer" or (method=="FireServer" and self:IsA("RemoteEvent"))) then
+            local args={...}
+            if #args>0 and (typeof(args[1])~="table" or next(args[1])) then
+                interceptEv:Fire(route,args)
+            end
+        end
+        return oldNamecall(self,...)
+    end
+    setreadonly(mt,true)
+    _G.__BUCKS_HOOK=true
+end
+
+--##############################################################
+--  MULTI‑TABS: ROOT + 4 InstancePanels
+--##############################################################
+
+-- Solo una pestaña a la vez puede “armar” el Intercept (one‑shot)
+local INTERCEPT_TARGET -- índice 1..4 (o nil)
+
+--------------------------------------------------------------  INSTANCE PANEL
+local InstancePanel = Roact.Component:extend("InstancePanel")
+
+function InstancePanel:init()
+    self.state = {
+        amount="0", sending=false, progress=0, timeRemaining=0,
+        status="", cancelRequested=false, pending=0,
+
+        interceptOn=false, -- por‑instancia
+
+        data={player="-",unique="-",block="-",remote="-"},
+        estInput="", estEta=0,
+
+        first=DEF_FIRST_SUB_INTERVAL, sub=DEF_SUB_INTERVAL, cooldown=DEF_COOLDOWN_SEC,
+    }
+
+    self._mounted = false
+    self._queueIntercept = {}
+
+    -- Registrar función de captura para que Root la invoque
+    if self.props.registerCapture then
+        self.props.registerCapture(self.props.index, function(route,args)
+            -- Deferimos SIEMPRE para evitar setState durante reconcil.
+            task.defer(function()
+                if not self._mounted then
+                    table.insert(self._queueIntercept, {route,args})
+                    return
+                end
+                -- Solo capturamos si esta pestaña es el target y está armada
+                if INTERCEPT_TARGET ~= self.props.index or not self.state.interceptOn then return end
+                local d={remote=route,player="-",unique="-",block="-"}
+                if typeof(args[1])=="Instance" and args[1]:IsA("Player") then
+                    d.player=args[1].Name; d.unique=tostring(args[2]); d.block=tostring(args[3])
+                else
+                    d.unique=tostring(args[1]); d.block=tostring(args[2])
+                end
+                if not self._mounted then return end
+                self:setState({data=d, interceptOn=false}) -- one‑shot → se apaga
+                if INTERCEPT_TARGET == self.props.index then INTERCEPT_TARGET = nil end
+            end)
+        end)
+    end
+end
+
+function InstancePanel:didMount()
+    self._mounted = true
+    -- Procesar cualquier intercept que haya llegado durante el montaje
+    if #self._queueIntercept > 0 then
+        for _,pack in ipairs(self._queueIntercept) do
+            local route, args = pack[1], pack[2]
+            if INTERCEPT_TARGET == self.props.index and self.state.interceptOn then
+                local d={remote=route,player="-",unique="-",block="-"}
+                if typeof(args[1])=="Instance" and args[1]:IsA("Player") then
+                    d.player=args[1].Name; d.unique=tostring(args[2]); d.block=tostring(args[3])
+                else
+                    d.unique=tostring(args[1]); d.block=tostring(args[2])
+                end
+                if self._mounted then
+                    self:setState({data=d, interceptOn=false})
+                end
+                if INTERCEPT_TARGET == self.props.index then INTERCEPT_TARGET = nil end
+            end
+        end
+        table.clear(self._queueIntercept)
+    end
+end
+
+function InstancePanel:willUnmount()
+    self._mounted = false
+end
+
+function InstancePanel:updateEstimator(text)
+    local captured = text
+    task.defer(function()
+        if self._mounted then
+            self:setState({estInput=captured, estEta=calcEta(captured,self.state.first,self.state.sub,self.state.cooldown)})
+        end
+    end)
+end
+
+function InstancePanel:resetConstants()
+    if not self._mounted then return end
+    self:setState({first=DEF_FIRST_SUB_INTERVAL, sub=DEF_SUB_INTERVAL, cooldown=DEF_COOLDOWN_SEC})
+end
+
+function InstancePanel:transfer()
+    if self.state.sending then return end
+
+    local total = tonumber(self.state.amount)
+    if not total or total <= 0 then
+        if self._mounted then self:setState{status = "❌ Invalid amount."} end
+        return
+    end
+
+    local d = self.state.data
+    if d.unique == "-" or d.block == "-" then
+        if self._mounted then self:setState{status = "❌ Intercept first."} end
+        return
+    end
+
+    -- ¿está conectado el destinatario?
+    if d.player ~= "-" then
+        local tgt = Players:FindFirstChild(d.player)
+        if not tgt then
+            if self._mounted then self:setState{status = "❌ The user is not connected."} end
+            return
+        end
+    end
+
+    -- Congelar parámetros locales de esta instancia
+    local FIRST_SUB_INTERVAL = self.state.first
+    local SUB_INTERVAL       = self.state.sub
+    local COOLDOWN_SEC       = self.state.cooldown
+
+    local nCycles     = math.ceil(total / CHUNK_SIZE)
+    local cycleSizes  = {}
+    for i = 1, nCycles do
+        if i < nCycles then cycleSizes[i] = CHUNK_SIZE
+        else cycleSizes[i] = total - CHUNK_SIZE * (nCycles - 1) end
+    end
+
+    local eta = calcEta(total, FIRST_SUB_INTERVAL, SUB_INTERVAL, COOLDOWN_SEC)
+
+    if self._mounted then
+        self:setState{
+            sending         = true,
+            cancelRequested = false,
+            status          = "⚙️ Sending…",
+            progress        = 0,
+            timeRemaining   = eta,
+            pending         = total,
+        }
+    end
+
+    task.spawn(function()
+        local sentTotal = 0
+        local leaveConn
+
+        if d.player ~= "-" then
+            leaveConn = Players.PlayerRemoving:Connect(function(plr)
+                if plr.Name == d.player and self._mounted then
+                    self:setState{cancelRequested = true}
+                end
+            end)
+        end
+
+        local function cleanup()
+            if leaveConn then leaveConn:Disconnect() end
+        end
+
+        for ci, cs in ipairs(cycleSizes) do
+            local ops = math.ceil(cs / MAX_OP)
+            for oi = 1, ops do
+                if self.state.cancelRequested then
+                    cleanup()
+                    if self._mounted then
+                        self:setState{
+                            sending       = false,
+                            status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                            timeRemaining = 0,
+                            pending       = total - sentTotal,
+                        }
+                    end
+                    return
+                end
+
+                local qty   = (oi < ops) and MAX_OP or (cs - MAX_OP * (ops - 1))
+                local route = (d.player ~= "-") and "HousingAPI/ActivateFurniture"
+                                             or "HousingAPI/ActivateInteriorFurniture"
+                local args  = (d.player ~= "-")
+                                and {Players:FindFirstChild(d.player), d.unique, d.block, qty, LP.Character}
+                                or  {d.unique, d.block, qty, LP.Character}
+                local remote = RouterClient.get(route)
+
+                local ok, err = pcall(function()
+                    remote.InvokeServer(remote, table.unpack(args))
+                end)
+                if not ok then
+                    cleanup()
+                    if self._mounted then
+                        self:setState{
+                            sending       = false,
+                            status        = ("❌ Operation %d.%d failed: %s"):format(ci, oi, err),
+                            timeRemaining = 0,
+                            pending       = total - sentTotal,
+                        }
+                    end
+                    return
+                end
+
+                sentTotal += qty
+                if self._mounted then
+                    self:setState{
+                        progress = sentTotal / total,
+                        status   = ("✅ %d/%d sent"):format(sentTotal, total),
+                        pending  = total - sentTotal,
+                    }
+                end
+
+                if oi < ops then
+                    local waitTime = (ci == 1) and FIRST_SUB_INTERVAL or SUB_INTERVAL
+                    for _ = 1, waitTime do
+                        task.wait(1)
+                        if self.state.cancelRequested then
+                            cleanup()
+                            if self._mounted then
+                                self:setState{
+                                    sending       = false,
+                                    status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                                    timeRemaining = 0,
+                                    pending       = total - sentTotal,
+                                }
+                            end
+                            return
+                        end
+                        if self._mounted then
+                            self:setState{timeRemaining = self.state.timeRemaining - 1}
+                        end
+                    end
+                end
+            end
+
+            if ci < nCycles then
+                for _ = 1, COOLDOWN_SEC do
+                    task.wait(1)
+                    if self.state.cancelRequested then
+                        cleanup()
+                        if self._mounted then
+                            self:setState{
+                                sending       = false,
+                                status        = ("🚫 Canceled. Amount sent: %d"):format(sentTotal),
+                                timeRemaining = 0,
+                                pending       = total - sentTotal,
+                            }
+                        end
+                        return
+                    end
+                    if self._mounted then
+                        self:setState{timeRemaining = self.state.timeRemaining - 1}
+                    end
+                end
+            end
+        end
+
+        cleanup()
+        if self._mounted then
+            self:setState{
+                sending       = false,
+                progress      = 1,
+                status        = "🎉 Done!",
+                timeRemaining = 0,
+                pending       = 0,
+            }
+        end
+    end)
+end
+
+function InstancePanel:render()
+    local s,d=self.state,self.state.data
+    local pct=s.progress
+    local showPend = s.sending and s.pending>0
+
+    -- Helpers para onChange con defer/guard
+    local function onTextSetState(key, coerce)
+        return function(rbx)
+            local val = rbx.Text
+            task.defer(function()
+                if not self._mounted then return end
+                if coerce then
+                    self:setState({[key]=safeNumber(val, self.state[key])})
+                else
+                    self:setState({[key]=val})
+                end
+            end)
+        end
+    end
+
+    return Roact.createElement("Frame",{
+        BackgroundTransparency=1, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+    },{
+        UILayout = Roact.createElement("UIListLayout",{
+            Padding = UDim.new(0,8), SortOrder = Enum.SortOrder.LayoutOrder,
+        }),
+        -- 1) Monto + Send
+        Row1 = Roact.createElement("Frame",{
+            LayoutOrder=1, BackgroundTransparency=1, Size=UDim2.new(1,0,0,34),
+        },{
+            Amount = Roact.createElement("TextBox",{
+                Text=s.amount,PlaceholderText="Amount",Font=Enum.Font.Gotham,TextSize=18,
+                BackgroundColor3=Color3.fromRGB(55,55,55),TextColor3=Color3.new(1,1,1),
+                ClearTextOnFocus=false,Size=UDim2.new(0.65,-4,1,0),
+                [Roact.Change.Text]=onTextSetState("amount", false),
+            }),
+            Send = Roact.createElement("TextButton",{
+                Text=s.sending and formatTime(s.timeRemaining) or "Send",
+                Font=Enum.Font.GothamBold,TextSize=18,
+                BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(0.35,-4,1,0),Position=UDim2.new(0.65,4,0,0),
+                [Roact.Event.Activated]=function() self:transfer() end,
+            }),
+        }),
+
+        -- 2) Progress + ETA
+        ProgBG = Roact.createElement("Frame",{
+            LayoutOrder=2, Size=UDim2.new(1,0,0,14),
+            BackgroundColor3=Color3.fromRGB(50,50,50),BorderSizePixel=0,
+        },{
+            UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}),
+            Fill=Roact.createElement("Frame",{
+                Size=UDim2.new(pct,0,1,0),BackgroundColor3=Color3.fromRGB(80,200,100),BorderSizePixel=0,
+            },{
+                UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})
+            }),
+        }),
+        ETA = Roact.createElement("TextLabel",{
+            LayoutOrder=3, Text="ETA: "..formatTime(s.timeRemaining),
+            Font=Enum.Font.Gotham,TextSize=15, BackgroundTransparency=1,
+            TextColor3=Color3.fromRGB(200,200,200), Size=UDim2.new(1,0,0,16),
+        }),
+
+        StopBtn = Roact.createElement("TextButton",{
+            LayoutOrder=4,Visible=s.sending,
+            Text="Stop transaction",Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundColor3=Color3.fromRGB(180,60,60),TextColor3=Color3.new(1,1,1),
+            BorderSizePixel=0,Size=UDim2.new(1,0,0,32),
+            [Roact.Event.Activated]=function() if self._mounted then self:setState({cancelRequested=true}) end end,
+        }),
+
+        Status = Roact.createElement("TextLabel",{
+            LayoutOrder=5, Text=s.status, Font=Enum.Font.Gotham,TextSize=15,
+            BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+            Size=UDim2.new(1,0,0,18),
+        }),
+        Pending = Roact.createElement("TextLabel",{
+            LayoutOrder=6,Visible=showPend,
+            Text="Quantity pending: "..s.pending,Font=Enum.Font.Gotham,TextSize=15,
+            BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),
+            TextXAlignment=Enum.TextXAlignment.Right,Size=UDim2.new(1,0,0,16),
+        }),
+
+        -- 3) Botón Intercept (por‑pestaña)
+        InterBtn = Roact.createElement("TextButton",{
+            LayoutOrder=7,
+            Text=(INTERCEPT_TARGET==self.props.index and s.interceptOn) and "🟢 Intercept ARMED" or (s.interceptOn and "🟢 Intercept ON" or "⚪ Intercept"),
+            Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundColor3=(INTERCEPT_TARGET==self.props.index and s.interceptOn) and Color3.fromRGB(60,140,60)
+                              or (s.interceptOn and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70)),
+            TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(1,0,0,30),
+            [Roact.Event.Activated]=function()
+                local newState = not self.state.interceptOn
+                if not self._mounted then return end
+                self:setState({interceptOn=newState})
+                if newState then
+                    INTERCEPT_TARGET = self.props.index -- dirigir la captura a esta pestaña
+                else
+                    if INTERCEPT_TARGET==self.props.index then INTERCEPT_TARGET=nil end
+                end
+            end,
+        }),
+
+        -- 4) Data card
+        DataCard = Roact.createElement("Frame",{
+            LayoutOrder=8,BackgroundColor3=Color3.fromRGB(45,45,45),
+            Size=UDim2.new(1,0,0,100),BorderSizePixel=0,
+        },{
+            UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+            Padding=Roact.createElement("UIPadding",{PaddingTop=UDim.new(0,6),PaddingLeft=UDim.new(0,8)}),
+            List=Roact.createElement("UIListLayout",{Padding=UDim.new(0,4),SortOrder=Enum.SortOrder.LayoutOrder}),
+            H=Roact.createElement("TextLabel",{LayoutOrder=0,Text=("Intercepted Data [%s]"):format(d.remote),Font=Enum.Font.GothamBold,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,-16,0,18)}),
+            P=Roact.createElement("TextLabel",{LayoutOrder=1,Text="Player : "..d.player,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+            U=Roact.createElement("TextLabel",{LayoutOrder=2,Text="Unique : "..d.unique,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+            B=Roact.createElement("TextLabel",{LayoutOrder=3,Text="Block  : "..d.block,Font=Enum.Font.Gotham,TextSize=14,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,16)}),
+        }),
+
+        -- 5) Variables
+        VarTitle = Roact.createElement("TextLabel",{LayoutOrder=9,Text="Variables",Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,22)}),
+
+        VarFrame = Roact.createElement("Frame",{LayoutOrder=10,BackgroundTransparency=1,Size=UDim2.new(1,0,0,112)},{
+            List  = Roact.createElement("UIListLayout",{Padding=UDim.new(0,4)}),
+
+            L1 = Roact.createElement("TextLabel",{Text="FIRST_SUB_INTERVAL",Font=Enum.Font.Gotham,TextSize=15,
+                BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+            T1 = Roact.createElement("TextBox",{Text=tostring(s.first),Font=Enum.Font.Gotham,TextSize=16,
+                BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                [Roact.Change.Text]=onTextSetState("first", true)}),
+
+            L2 = Roact.createElement("TextLabel",{Text="SUB_INTERVAL",Font=Enum.Font.Gotham,TextSize=15,
+                BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+            T2 = Roact.createElement("TextBox",{Text=tostring(s.sub),Font=Enum.Font.Gotham,TextSize=16,
+                BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                [Roact.Change.Text]=onTextSetState("sub", true)}),
+
+            L3 = Roact.createElement("TextLabel",{Text="COOLDOWN_SEC",Font=Enum.Font.Gotham,TextSize=15,
+                BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,16)}),
+            T3 = Roact.createElement("TextBox",{Text=tostring(s.cooldown),Font=Enum.Font.Gotham,TextSize=16,
+                BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),
+                Size=UDim2.new(1,0,0,24),ClearTextOnFocus=false,
+                [Roact.Change.Text]=onTextSetState("cooldown", true)}),
+        }),
+
+        SpacerAfterVars = Roact.createElement("Frame",{LayoutOrder=11,BackgroundTransparency=1, Size=UDim2.new(1,0,0,8)}),
+
+        ResetBtn = Roact.createElement("TextButton",{LayoutOrder=12,
+            Text="Reset constants",Font=Enum.Font.GothamBold,TextSize=18,
+            BackgroundColor3=Color3.fromRGB(70,70,150),TextColor3=Color3.new(1,1,1),
+            BorderSizePixel=0,Size=UDim2.new(1,0,0,34),
+            [Roact.Event.Activated]=function() self:resetConstants() end}),
+
+        EstLbl = Roact.createElement("TextLabel",{LayoutOrder=13,Text="How long would it take?",Font=Enum.Font.GothamBold,TextSize=18,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,22)}),
+        EstFrame = Roact.createElement("Frame",{LayoutOrder=14,BackgroundColor3=Color3.fromRGB(45,45,45),Size=UDim2.new(1,0,0,46),BorderSizePixel=0},{
+            UICorner=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+            EstInput=Roact.createElement("TextBox",{Text=s.estInput,PlaceholderText="Amount",Font=Enum.Font.Gotham,TextSize=17,BackgroundColor3=Color3.fromRGB(60,60,60),TextColor3=Color3.new(1,1,1),ClearTextOnFocus=false,Size=UDim2.new(0.55,-4,0,30),Position=UDim2.new(0,8,0,8),[Roact.Change.Text]=function(t) self:updateEstimator(t.Text) end}),
+            EstBtn=Roact.createElement("TextButton",{Text="Estimate",Font=Enum.Font.GothamBold,TextSize=17,BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.35,-4,0,30),Position=UDim2.new(0.62,4,0,8),[Roact.Event.Activated]=function() self:updateEstimator(s.estInput) end}),
+        }),
+        EstRes = Roact.createElement("TextLabel",{LayoutOrder=15,Text=(s.estEta>0)and("You would need to wait "..formatTime(s.estEta))or"",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,0,0,18)}),
+
+        Footer = Roact.createElement("TextLabel",{LayoutOrder=16,Text=("Instance %d | Created by 0Systems - hehehe"):format(self.props.index),Font=Enum.Font.Gotham,TextSize=13,BackgroundTransparency=1,TextColor3=Color3.fromRGB(150,150,150),TextXAlignment=Enum.TextXAlignment.Center,Size=UDim2.new(1,0,0,18)}),
+    })
+end
+
+--------------------------------------------------------------  ROOT (tabs + anti‑AFK + drag + toggle UI)
+local Root = Roact.Component:extend("BucksRoot")
+
+function Root:init()
+    self.state = {
+        showUI = true,
+        dragging=false, dragOffset=Vector2.zero,
+        pos=UDim2.new(0.5,-309,0.5,-200), -- ventana 618×420 aprox
+
+        activeTab = 1, -- 1..4
+        antiAFKOn = false,
+    }
+
+    -- Tabla de capturas registradas por cada instancia
+    self.capturers = {}
+
+    -- Suscribir UNA vez al intercept global y redirigir a la pestaña “armada”
+    self.interceptConn = interceptEv.Event:Connect(function(route,args)
+        local idx = INTERCEPT_TARGET
+        if idx and self.capturers[idx] then
+            -- Defer para evitar setState durante reconcil en la instancia
+            task.defer(function()
+                if self.capturers[idx] then
+                    self.capturers[idx](route,args)
+                end
+            end)
+        end
+    end)
+end
+
+function Root:willUnmount()
+    if self.interceptConn then self.interceptConn:Disconnect() end
+    if self.afkConn then self.afkConn:Disconnect() end
+end
+
+function Root:registerCapture(index, fn)
+    self.capturers[index] = fn
+end
+
+------------------------------  DRAG
+function Root:startDrag(io)
+    self:setState({dragging=true, dragOffset=getPos(io)-self.ref.AbsolutePosition})
+end
+function Root:doDrag(io)
+    if self.state.dragging then
+        local np = getPos(io)-self.state.dragOffset
+        self:setState({pos=UDim2.new(0,np.X,0,np.Y)})
+    end
+end
+function Root:stopDrag() self:setState({dragging=false}) end
+
+------------------------------  TOGGLES
+function Root:toggleUI()
+    self:setState({showUI=not self.state.showUI})
+end
+
+function Root:toggleAntiAFK()
+    if not self.state.antiAFKOn then
+        self.afkConn = Players.LocalPlayer.Idled:Connect(function()
+            VU:CaptureController(); VU:ClickButton2(Vector2.zero)
+        end)
+    elseif self.afkConn then
+        self.afkConn:Disconnect(); self.afkConn=nil
+    end
+    self:setState({antiAFKOn=not self.state.antiAFKOn})
+end
+
+function Root:render()
+    local s=self.state
+
+    ------------------------------------------------------------  BOTÓN FLOTANTE ☰
+    local ToggleButton = Roact.createElement("TextButton",{
+        Text="☰",Font=Enum.Font.GothamBold,TextSize=22,
+        BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),
+        Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,10),ZIndex=5,
+        [Roact.Event.Activated]=function() self:toggleUI() end,
+    })
+
+    ------------------------------------------------------------  CONTENEDOR PRINCIPAL
+    local MainFrame = Roact.createElement("Frame",{
+        Visible=s.showUI,
+        Size=UDim2.new(0,618,0,420),
+        Position=s.pos,
+        BackgroundColor3=Color3.fromRGB(30,30,30),BorderSizePixel=0,
+        [Roact.Ref]=function(r)self.ref=r end,
+        [Roact.Event.InputBegan]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseButton1 then self:startDrag(io)end end,
+        [Roact.Event.InputChanged]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseMovement then self:doDrag(io)end end,
+        [Roact.Event.InputEnded]=function(_,io)if io.UserInputType==Enum.UserInputType.MouseButton1 then self:stopDrag()end end,
+    },{
+        UICorner = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+        -- Barra superior con tabs + Anti‑AFK
+        Header = Roact.createElement("Frame",{
+            BackgroundTransparency=1, Size=UDim2.new(1,0,0,46),
+        },{
+            Tabs = Roact.createElement("Frame",{
+                BackgroundTransparency=1, Size=UDim2.new(0.72,0,1,0), Position=UDim2.new(0,10,0,8),
+            },{
+                List = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,6)}),
+                (function()
+                    local children = {}
+                    for i=1,4 do
+                        children["Tab"..i] = Roact.createElement("TextButton",{
+                            Text=("Instance %d"):format(i),
+                            Font=Enum.Font.GothamBold, TextSize=16,
+                            BackgroundColor3=(s.activeTab==i) and Color3.fromRGB(70,120,200) or Color3.fromRGB(60,60,60),
+                            TextColor3=Color3.new(1,1,1), BorderSizePixel=0,
+                            Size=UDim2.new(0,130,1,-8),
+                            [Roact.Event.Activated]=function() self:setState({activeTab=i}) end,
+                        },{
+                            UIC = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})
+                        })
+                    end
+                    return children
+                end)()
+            }),
+
+            AntiAFK = Roact.createElement("TextButton",{
+                Text=s.antiAFKOn and "🟢 Anti‑AFK ON" or "⚪ Anti‑AFK",
+                Font=Enum.Font.GothamBold,TextSize=16,
+                BackgroundColor3=s.antiAFKOn and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),
+                TextColor3=Color3.new(1,1,1), BorderSizePixel=0,
+                Size=UDim2.new(0.24, -20, 1, -8), Position=UDim2.new(0.76,10,0,8),
+                [Roact.Event.Activated]=function() self:toggleAntiAFK() end,
+            },{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})})
+        }),
+
+        -- Separador
+        Sep = Roact.createElement("Frame",{
+            BackgroundColor3=Color3.fromRGB(55,55,55), BorderSizePixel=0,
+            Size=UDim2.new(1, -20, 0, 1), Position=UDim2.new(0,10,0,46),
+        }),
+
+        -- Scroll con contenido de la pestaña
+        Scroll = Roact.createElement("ScrollingFrame",{
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            CanvasSize = UDim2.new(0,0,0,0),
+            ScrollBarThickness = 6,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1,0,1,-56),
+            Position = UDim2.new(0,0,0,54),
+        },{
+            Wrapper = Roact.createElement("Frame",{
+                BackgroundTransparency = 1,
+                Size = UDim2.new(0,390,0,0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                AnchorPoint = Vector2.new(0.5,0),
+                Position = UDim2.new(0.5,0,0,10),
+            },{
+                UILayout = Roact.createElement("UIListLayout",{
+                    Padding = UDim.new(0,8),
+                    SortOrder = Enum.SortOrder.LayoutOrder,
+                }),
+
+                Title = Roact.createElement("TextLabel",{
+                    LayoutOrder=0,
+                    Text="Bucks Transfer",Font=Enum.Font.GothamBold,TextSize=22,
+                    BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+                    Size=UDim2.new(1,0,0,28),
+                }),
+
+                -- Contenido de las 4 instancias (siempre montadas; visibilidad por tab)
+                Inst1 = Roact.createElement("Frame",{LayoutOrder=1,BackgroundTransparency=1, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, Visible=(s.activeTab==1)},{
+                    Panel = Roact.createElement(InstancePanel,{index=1, registerCapture=function(i,fn) self:registerCapture(i,fn) end})
+                }),
+                Inst2 = Roact.createElement("Frame",{LayoutOrder=2,BackgroundTransparency=1, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, Visible=(s.activeTab==2)},{
+                    Panel = Roact.createElement(InstancePanel,{index=2, registerCapture=function(i,fn) self:registerCapture(i,fn) end})
+                }),
+                Inst3 = Roact.createElement("Frame",{LayoutOrder=3,BackgroundTransparency=1, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, Visible=(s.activeTab==3)},{
+                    Panel = Roact.createElement(InstancePanel,{index=3, registerCapture=function(i,fn) self:registerCapture(i,fn) end})
+                }),
+                Inst4 = Roact.createElement("Frame",{LayoutOrder=4,BackgroundTransparency=1, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, Visible=(s.activeTab==4)},{
+                    Panel = Roact.createElement(InstancePanel,{index=4, registerCapture=function(i,fn) self:registerCapture(i,fn) end})
+                }),
+
+                Footer = Roact.createElement("TextLabel",{LayoutOrder=99,Text="Multi‑Tabs v16 • Anti‑AFK global • Created by 0Systems - hehehe",Font=Enum.Font.Gotham,TextSize=13,BackgroundTransparency=1,TextColor3=Color3.fromRGB(150,150,150),TextXAlignment=Enum.TextXAlignment.Center,Size=UDim2.new(1,0,0,18)}),
+            }),
+        }),
+    })
+
+    return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+        Toggle = ToggleButton,
+        Main   = MainFrame,
+    })
+end
+
+-- Montar raíz
+Roact.mount(Roact.createElement(Root), LP:WaitForChild("PlayerGui"))
