@@ -1,0 +1,242 @@
+-- AutoMaxPotions.local.lua
+-- Coloca este LocalScript en StarterPlayerScripts
+-- Aplica automáticamente todas las pociones disponibles a todas las pets del inventario
+
+-- =========================
+-- CONFIG
+-- =========================
+local APPLY_ONLY_THESE_KINDS = nil 
+-- Ejemplos:
+-- APPLY_ONLY_THESE_KINDS = { "pet_riding_potion", "pet_flying_potion" }  -- solo ride/fly
+-- nil => usa TODAS las pociones que tengas en inventario
+
+local DELAY_BETWEEN_INVOCES = 0.2 -- anti-spam
+local RUN_ON_JOIN = true          -- ejecuta automáticamente al cargar
+local INCLUDE_EGGS = false        -- no aplicar a huevos por defecto
+
+-- =========================
+-- DEPENDENCIAS
+-- =========================
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+repeat task.wait() until game:IsLoaded()
+
+local load = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+
+local ClientData              = load("ClientData")
+local RouterClient            = load("RouterClient")
+local PetPotionEffectsDB      = load("PetPotionEffectsDB")
+local InventoryDB             = load("InventoryDB")
+local PetObjectCreatorType    = load("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+local EquippedPets            = load("EquippedPets")
+local StreamingHelper         = load("new:StreamingHelper")
+local Promise                 = load("package:Promise")
+
+-- =========================
+-- UTILIDADES
+-- =========================
+local function getInventory()
+    return ClientData.get("inventory")
+end
+
+local function isPotionItem(foodItem)
+    -- Es poción si existe entrada en PetPotionEffectsDB
+    return foodItem and PetPotionEffectsDB[foodItem.id] ~= nil
+end
+
+local function kindAllowed(kind)
+    if not APPLY_ONLY_THESE_KINDS then return true end
+    for _, k in ipairs(APPLY_ONLY_THESE_KINDS) do
+        if k == kind then return true end
+    end
+    return false
+end
+
+local function isEggOrDoll(petEntry)
+    local petDB = InventoryDB.pets[petEntry.pet_id]
+    if not petDB then return false end
+    if petDB.is_egg then return true end
+    if petDB.is_doll then return true end
+    return false
+end
+
+-- agrupa las food por "kind" y mantiene lista de instancias por unique
+local function groupPotionsByKind(foodTable)
+    local byKind = {}
+    for _, item in pairs(foodTable or {}) do
+        if isPotionItem(item) and kindAllowed(item.kind) then
+            byKind[item.kind] = byKind[item.kind] or {}
+            table.insert(byKind[item.kind], item)
+        end
+    end
+    -- Orden estable (opcional)
+    for _, list in pairs(byKind) do
+        table.sort(list, function(a, b)
+            return tostring(a.unique) < tostring(b.unique)
+        end)
+    end
+    return byKind
+end
+
+-- intenta consumir una poción para una mascota concreta
+local function applyPotionToPet(pet_unique, item)
+    -- payload tal cual usa feed_pet/create_pet_object
+    local payload = {
+        unique_id = item.unique,
+        pet_unique = pet_unique,
+        additional_consume_uniques = {}, -- por si necesitas multi-consumo del mismo tipo
+        spawn_cframe = nil, -- opcional
+    }
+    local rf = RouterClient.get("PetObjectAPI/CreatePetObject")
+    local ok = false
+
+    -- Espera con timeout razonable como en el decompilado (15s)
+    local instanceOrNil = StreamingHelper.await(rf:InvokeServer(PetObjectCreatorType.PetFood, payload), 15)
+    if instanceOrNil then
+        ok = true
+    end
+    return ok
+end
+
+-- calcula usos máximos teóricos para ese item/pet basándose en PetPotionEffectsDB
+-- si no se puede calcular, devolverá un número grande y dejaremos que el servidor corte.
+local function getMaxUsesFor(item, petWrapper)
+    local def = PetPotionEffectsDB[item.id]
+    if not def then return 1 end
+
+    local uses = def.multi_use_count or 1
+    if type(uses) == "function" then
+        -- En el decompilado llaman a uses(arg1, EquippedPets.get_item_from_wrapper(arg1))
+        -- Aquí aproximamos: si devuelve true/false o un número.
+        local ok, result = pcall(function()
+            return uses(petWrapper, EquippedPets.get_item_from_wrapper(petWrapper))
+        end)
+        if ok then
+            if typeof(result) == "number" then
+                return math.max(0, result)
+            else
+                -- si la función era un validador, no un contador, deja que el server decida
+                return 9999
+            end
+        else
+            return 9999
+        end
+    end
+    return uses
+end
+
+-- Crea un "petWrapper" mínimo compatible para llamadas de validación (cuando haga falta)
+local function makePetWrapper(pet_unique, pet_id)
+    return {
+        pet_unique = pet_unique,
+        pet_id = pet_id,
+        char = Players.LocalPlayer.Character, -- suficiente para la mayoría de validaciones cliente
+    }
+end
+
+-- =========================
+-- PROCESO PRINCIPAL
+-- =========================
+local running = false
+
+local function autoMaxAllPets()
+    if running then
+        warn("[AutoMaxPotions] Ya estaba ejecutándose.")
+        return
+    end
+    running = true
+
+    local inv = getInventory()
+    if not inv then
+        warn("[AutoMaxPotions] Inventario no disponible.")
+        running = false
+        return
+    end
+
+    local potionsByKind = groupPotionsByKind(inv.food)
+    if next(potionsByKind) == nil then
+        warn("[AutoMaxPotions] No tienes pociones disponibles.")
+        running = false
+        return
+    end
+
+    -- lista de mascotas (tabla inv.pets: [pet_unique] = { pet_id = ..., properties = ... })
+    local pets = inv.pets or {}
+
+    -- Recorremos mascotas
+    for pet_unique, petEntry in pairs(pets) do
+        if not running then break end
+
+        if (INCLUDE_EGGS or not isEggOrDoll(petEntry)) then
+            local petWrapper = makePetWrapper(pet_unique, petEntry.pet_id)
+
+            -- por cada tipo de poción que tengas
+            for kind, itemsList in pairs(potionsByKind) do
+                if not running then break end
+                if #itemsList == 0 then
+                    continue
+                end
+
+                -- Determina usos “máximos” aproximados (si la DB lo sabe)
+                local peekItem = itemsList[1]
+                local maxUses = getMaxUsesFor(peekItem, petWrapper)
+                local usesDone = 0
+
+                -- Aplica una por una hasta quedarte sin items o el server rechace
+                local i = 1
+                while running and itemsList[i] do
+                    local item = itemsList[i]
+                    local ok = applyPotionToPet(pet_unique, item)
+                    if ok then
+                        usesDone += 1
+                        -- Consumido con éxito => quita el item de la lista local
+                        table.remove(potionsByKind[kind], i)
+                    else
+                        -- Rechazado por el servidor: seguramente ya alcanzó el límite
+                        break
+                    end
+
+                    -- Límite cliente (opcional). Si no lo sabemos, el server cortará solo.
+                    if usesDone >= maxUses then
+                        break
+                    end
+
+                    task.wait(DELAY_BETWEEN_INVOCES)
+                end
+            end
+        end
+
+        task.wait(DELAY_BETWEEN_INVOCES)
+    end
+
+    running = false
+    print("[AutoMaxPotions] Proceso terminado.")
+end
+
+-- =========================
+-- DISPARO AUTOMÁTICO / COMANDO
+-- =========================
+if RUN_ON_JOIN then
+    -- Espera a que tengas character para validar algunos módulos
+    LocalPlayer.CharacterAdded:Wait()
+    task.defer(autoMaxAllPets)
+end
+
+-- Comando simple por Chat para activar manualmente:
+-- Escribe /maxpotions en el chat
+local ChatService = game:GetService("StarterGui")
+local function hookChatCommand()
+    -- Los chats personalizados varían; si usas TextChatService, adapta este handler.
+    -- Aquí dejamos un ejemplo genérico con Player.Chatted:
+    LocalPlayer.Chatted:Connect(function(msg)
+        msg = string.lower(msg or "")
+        if msg == "/maxpotions" then
+            autoMaxAllPets()
+        elseif msg == "/stopmax" then
+            running = false
+            warn("[AutoMaxPotions] Cancelado por el usuario.")
+        end
+    end)
+end
+pcall(hookChatCommand)
