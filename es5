@@ -1,0 +1,132 @@
+-- AutoMaxPotions.local.lua
+-- Colócalo en StarterPlayerScripts
+
+local Players      = game:GetService("Players")
+local Replicated   = game:GetService("ReplicatedStorage")
+
+local Fsys         = require(Replicated:WaitForChild("Fsys"))
+local load         = Fsys.load          -- función de carga de paquetes
+
+-- ==========   CLIENT‑SAFE MODULES   ==========
+local ClientData   = load("ClientData")
+local RouterClient = load("RouterClient")
+local PotionDB     = load("PetPotionEffectsDB")
+local PetObjType   = load("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+local StreamHelper = load("new:StreamingHelper")
+
+-- opcionales pero útiles
+local EquippedPets = load("EquippedPets")      -- para validaciones multi‑uso
+local InventoryDB  = load("InventoryDB")       -- detectar huevos/dolls
+------------------------------------------------
+
+---------------------------------------------------------------------
+--  A   D   J   U   S   T   E   S
+---------------------------------------------------------------------
+local APPLY_ONLY_KINDS   = nil           -- p.e. { "pet_riding_potion" }
+local INCLUDE_EGGS       = false         -- true = también huevos
+local DELAY              = 0.25          -- segundos entre invocations
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+--  H   E   L   P   E   R   S
+---------------------------------------------------------------------
+local function isPotion(item)
+    return PotionDB[item.id] ~= nil
+end
+
+local function kindAllowed(kind)
+    if not APPLY_ONLY_KINDS then return true end
+    for _,k in ipairs(APPLY_ONLY_KINDS) do
+        if k == kind then return true end
+    end
+    return false
+end
+
+local function isEggOrDoll(entry)
+    local def = InventoryDB.pets[entry.pet_id]
+    return def and (def.is_egg or def.is_doll)
+end
+
+-- agrupa las pociones por kind
+local function groupPotions(list)
+    local byKind = {}
+    for _,it in pairs(list) do
+        if isPotion(it) and kindAllowed(it.kind) then
+            (byKind[it.kind] or (function() byKind[it.kind] = {}; return byKind[it.kind] end)())
+            table.insert(byKind[it.kind], it)
+        end
+    end
+    return byKind
+end
+
+local function applyPotion(petUnique, item)
+    local payload = {
+        unique_id = item.unique,
+        pet_unique = petUnique,
+        additional_consume_uniques = {},
+    }
+    local rf = RouterClient.get("PetObjectAPI/CreatePetObject")
+
+    local okObj = StreamHelper.await(
+        rf:InvokeServer(PetObjType.PetFood, payload),
+        15            -- timeout
+    )
+    return okObj ~= nil
+end
+---------------------------------------------------------------------
+--  M   A   I   N
+---------------------------------------------------------------------
+local running = false
+local function autoMax()
+    if running then return end
+    running = true
+
+    local inv = ClientData.get("inventory")
+    if not inv then
+        warn("[AutoMaxPotions] Inventario vacío.")
+        running = false
+        return
+    end
+
+    local potions = groupPotions(inv.food)
+    if not next(potions) then
+        warn("[AutoMaxPotions] No hay pociones disponibles.")
+        running = false
+        return
+    end
+
+    for petUnique, entry in pairs(inv.pets or {}) do
+        if not running then break end
+        if (INCLUDE_EGGS or not isEggOrDoll(entry)) then
+            for kind, list in pairs(potions) do
+                local i = 1
+                while list[i] do
+                    if not running then break end
+                    if not applyPotion(petUnique, list[i]) then
+                        -- el servidor ya no acepta más de este tipo
+                        break
+                    end
+                    table.remove(list, i)
+                    task.wait(DELAY)
+                end
+            end
+        end
+        task.wait(DELAY)
+    end
+    running = false
+    print("[AutoMaxPotions] Terminado.")
+end
+
+-- Ejecuta automáticamente al unirse
+Players.LocalPlayer.CharacterAdded:Wait()
+task.defer(autoMax)
+
+-- Comandos de chat para lanzar o detener
+Players.LocalPlayer.Chatted:Connect(function(msg)
+    msg = string.lower(msg)
+    if msg == "/maxpotions" then
+        autoMax()
+    elseif msg == "/stopmax" then
+        running = false
+    end
+end)
