@@ -1,0 +1,359 @@
+-- LocalScript: Buscar id del Frost Dragon y marcarlo en el Journal
+-- Funciona en cliente. Comandos:
+/find_fd                → lista los candidatos (por defecto busca “frost dragon”)
+/find_fd <texto>        → busca por el texto dado (ej. /find_fd evil unicorn)
+/autocollect_fd         → intenta encontrar el Frost Dragon y marcarlo automáticamente
+/collect_fd <id>        → marca ese id en el journal y hace commit
+/uncollect_fd <id>      → elimina la marca del journal para ese id
+
+-- ====== Envoltorios seguros / utilidades ======
+local _pcall = rawget(_G, "pcall")
+local SAFE_PCALL = (type(_pcall)=="function") and function(fn, ...) return _pcall(fn, ...) end or function(fn, ...) return true, fn(...) end
+local function LOG(tag, ...) print(string.format("%s %s", tag, os.date("!%H:%M:%S")), ...) end
+local function logI(...) LOG("🟢 [FD-Finder]", ...) end
+local function logW(...) LOG("⚠️  [FD-Finder]", ...) end
+local function logS(...) LOG("✅ [FD-Finder]", ...) end
+
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+if not RunService:IsClient() then return end
+local LP = Players.LocalPlayer
+if not LP then return end
+
+-- ====== Fsys ======
+local okFsys, FLOAD = SAFE_PCALL(function() return require(RS:WaitForChild("Fsys")).load end)
+if not okFsys or type(FLOAD) ~= "function" then
+    logW("No se pudo obtener Fsys.load; abortando.")
+    return
+end
+
+-- ====== Cargar módulos base ======
+local InventoryDB, TranslationHelper, ClientData, RouterClient = nil,nil,nil,nil
+do
+    local ok1, m1 = SAFE_PCALL(function() return FLOAD("InventoryDB") end)
+    local ok2, m2 = SAFE_PCALL(function() return FLOAD("TranslationHelper") end)
+    local ok3, m3 = SAFE_PCALL(function() return FLOAD("ClientData") end)
+    local ok4, m4 = SAFE_PCALL(function() return FLOAD("RouterClient") end)
+    InventoryDB = ok1 and m1 or nil
+    TranslationHelper = ok2 and m2 or nil
+    ClientData = ok3 and m3 or nil
+    RouterClient = ok4 and m4 or nil
+    if not (InventoryDB and ClientData and RouterClient) then
+        logW("Faltan módulos requeridos (InventoryDB/ClientData/RouterClient).")
+        return
+    end
+end
+
+-- ====== Helpers ClientData / Commit ======
+local function CD_get(key)
+    local ok, v = SAFE_PCALL(function() return ClientData.get(key) end)
+    return ok and v or nil
+end
+local function CD_set(key, value)
+    if type(ClientData.set) == "function" then
+        local ok = SAFE_PCALL(function() ClientData.set(key, value) end)
+        if ok then return true end
+    end
+    if type(ClientData.update) == "function" then
+        local ok = SAFE_PCALL(function() ClientData.update(key, value) end)
+        if ok then return true end
+    end
+    return false
+end
+local function commit_collection()
+    local ok, route = SAFE_PCALL(function() return RouterClient.get("JournalAPI/CommitCollection") end)
+    if ok and route and typeof(route.FireServer) == "function" then
+        local ok2 = SAFE_PCALL(function() route:FireServer() end)
+        return ok2 and true or false
+    end
+    return false
+end
+
+-- ====== Normalización / scoring de coincidencias ======
+local function to_str(x)
+    if typeof(x) == "Instance" then return x.Name end
+    if x == nil then return "" end
+    return tostring(x)
+end
+local function normalize(s)
+    s = (to_str(s)):lower()
+    -- reemplaza separadores comunes por espacio
+    s = s:gsub("[_%-%./]", " ")
+    -- colapsa espacios
+    s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return s
+end
+local function compact(s)
+    -- sin espacios ni separadores, sólo alfanumérico
+    s = (to_str(s)):lower()
+    s = s:gsub("[^%w]", "")
+    return s
+end
+local function tokens(s)
+    local t = {}
+    for w in normalize(s):gmatch("%S+") do t[#t+1]=w end
+    return t
+end
+
+local function translate_name(entry)
+    local nameKey = entry and entry.name
+    if not nameKey then return nil end
+    if TranslationHelper and type(TranslationHelper.translate) == "function" then
+        local ok, txt = SAFE_PCALL(function() return TranslationHelper.translate(workspace, nameKey) end)
+        if ok and type(txt)=="string" and #txt>0 then return txt end
+    end
+    -- fallbacks
+    return entry.display_name or entry.name or ""
+end
+
+-- Calcula puntuación para un entry comparado con query
+local function score_entry(kind, entry, query)
+    local q_norm = normalize(query)
+    local q_comp = compact(query)
+    local disp = translate_name(entry) or ""
+    local kind_norm = normalize(kind)
+    local kind_comp = compact(kind)
+    local disp_norm = normalize(disp)
+    local disp_comp = compact(disp)
+
+    local base = 0
+    local variants = {
+        kind_norm, kind_comp,
+        (kind_norm:gsub(" ", "_")),
+        (kind_norm:gsub(" ", "-")),
+        disp_norm, disp_comp,
+        (disp_norm:gsub(" ", "_")),
+        (disp_norm:gsub(" ", "-")),
+    }
+
+    -- exactos sobre variantes
+    for _,v in ipairs(variants) do
+        if v == q_norm or v == q_comp then
+            base = base + 50
+        end
+    end
+    -- contiene todos los tokens (ej. frost & dragon)
+    local ok_all = true
+    for _,tk in ipairs(tokens(q_norm)) do
+        if not (kind_norm:find(tk, 1, true) or disp_norm:find(tk, 1, true)) then
+            ok_all = false; break
+        end
+    end
+    if ok_all then base = base + 25 end
+
+    -- startswith / substring útiles
+    if kind_comp:sub(1, #q_comp) == q_comp or disp_comp:sub(1, #q_comp) == q_comp then
+        base = base + 10
+    end
+    if kind_comp:find(q_comp, 1, true) or disp_comp:find(q_comp, 1, true) then
+        base = base + 5
+    end
+
+    -- bonus por “frost dragon” exactamente en display
+    if disp_norm == "frost dragon" or kind_norm == "frost dragon" then base = base + 15 end
+
+    return base
+end
+
+-- ====== Búsqueda en InventoryDB.pets ======
+local function getPets()
+    local pets = InventoryDB and InventoryDB["pets"]
+    if type(pets) ~= "table" then return {} end
+    return pets
+end
+
+local DEFAULT_QUERIES = {
+    "frost dragon","frost_dragon","frost-dragon","frostdragon",
+    "dragon frost","frost  dragon", -- con doble espacio por si acaso tras normalización
+}
+
+local function find_candidates(q)
+    q = q and #q>0 and q or "frost dragon"
+    local pets = getPets()
+    local results = {}
+    for kind, entry in pairs(pets) do
+        local s = score_entry(kind, entry, q)
+        if s > 0 then
+            results[#results+1] = {
+                kind = kind,
+                name = translate_name(entry) or (entry and entry.name) or "",
+                score = s,
+                rarity = entry and entry.rarity or nil,
+                is_egg = entry and entry.is_egg or nil,
+            }
+        end
+    end
+    table.sort(results, function(a,b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.kind < b.kind
+    end)
+    return results
+end
+
+local function auto_find_frost_dragon()
+    -- Probar varias queries y fusionar resultados priorizando los de mayor score
+    local map = {}
+    for _,q in ipairs(DEFAULT_QUERIES) do
+        for _,r in ipairs(find_candidates(q)) do
+            local prev = map[r.kind]
+            if not prev or r.score > prev.score then
+                map[r.kind] = r
+            end
+        end
+    end
+    local list = {}
+    for _,r in pairs(map) do list[#list+1]=r end
+    table.sort(list, function(a,b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.kind < b.kind
+    end)
+    return list
+end
+
+-- ====== Marcar en el journal ======
+local function mark_collected(kind, opts)
+    opts = opts or {}
+    local coll = CD_get("journal_collection")
+    if type(coll) ~= "table" then coll = {} end
+    if type(coll.pets) ~= "table" then coll.pets = {} end
+
+    if coll.pets[kind] ~= true then
+        coll.pets[kind] = true
+        logI(("Marcando pets → %s = true"):format(kind))
+    else
+        logI(("Ya estaba marcado: pets → %s"):format(kind))
+    end
+
+    -- Flag auxiliar mega_neon (opcional)
+    if opts.setMega then
+        local metaKey = "journal_pet_flags"
+        local meta = CD_get(metaKey)
+        if type(meta) ~= "table" then meta = {} end
+        if type(meta[kind]) ~= "table" then meta[kind] = {} end
+        if meta[kind].mega_neon ~= true then
+            meta[kind].mega_neon = true
+            CD_set(metaKey, meta)
+            logI("Flag auxiliar mega_neon = true")
+        end
+    end
+
+    local okWrite = CD_set("journal_collection", coll)
+    if not okWrite then
+        logW("No se pudo escribir 'journal_collection' en ClientData.")
+        return false
+    end
+    local okCommit = commit_collection()
+    if okCommit then
+        logS(("CommitCollection OK para '%s'"):format(kind))
+        return true
+    else
+        logW("CommitCollection falló.")
+        return false
+    end
+end
+
+-- ====== Comandos de chat ======
+local LP = Players.LocalPlayer
+LP.Chatted:Connect(function(msg)
+    msg = msg or ""
+    local low = msg:lower()
+    local args = {}
+    for w in msg:gmatch("%S+") do args[#args+1]=w end
+
+    if low == "/find_fd" then
+        local results = auto_find_frost_dragon()
+        if #results == 0 then
+            logW("No se encontraron candidatos para Frost Dragon.")
+        else
+            logS(("Candidatos Frost Dragon (top %d):"):format(math.min(#results, 12)))
+            for i=1, math.min(#results, 12) do
+                local r = results[i]
+                print(string.format("  #%d  kind=%s | name=%s | score=%d | rarity=%s",
+                    i, r.kind, r.name, r.score, tostring(r.rarity)))
+            end
+            print("Usa: /collect_fd <id>  para marcar uno. Ej: /collect_fd frost_dragon")
+        end
+
+    elseif args[1] == "/find_fd" and args[2] then
+        local q = table.concat(args, " ", 2)
+        local results = find_candidates(q)
+        if #results == 0 then
+            logW(("Sin resultados para: '%s'"):format(q))
+        else
+            logS(("Resultados para '%s' (top %d):"):format(q, math.min(#results, 12)))
+            for i=1, math.min(#results, 12) do
+                local r = results[i]
+                print(string.format("  #%d  kind=%s | name=%s | score=%d | rarity=%s",
+                    i, r.kind, r.name, r.score, tostring(r.rarity)))
+            end
+            print("Usa: /collect_fd <id>  para marcar uno.")
+        end
+
+    elseif low == "/autocollect_fd" then
+        local list = auto_find_frost_dragon()
+        if #list == 0 then
+            logW("No encontré ningún candidato para Frost Dragon.")
+        elseif #list >= 2 and (list[1].score - list[2].score) < 20 then
+            logW("Hay varios candidatos muy parecidos. Revisa con /find_fd y usa /collect_fd <id>.")
+            for i=1, math.min(#list, 8) do
+                local r = list[i]
+                print(string.format("  → %s (name=%s, score=%d)", r.kind, r.name, r.score))
+            end
+        else
+            local r = list[1]
+            logI(("Candidato elegido automáticamente: %s (name=%s, score=%d)"):format(r.kind, r.name, r.score))
+            local ok = mark_collected(r.kind, { setMega = true })
+            if ok then
+                logS(("Marcado y commit OK: %s"):format(r.kind))
+            else
+                logW("No se pudo completar el marcado automático.")
+            end
+        end
+
+    elseif args[1] == "/collect_fd" and args[2] then
+        local id = args[2]
+        local ok = mark_collected(id, { setMega = true })
+        if ok then
+            logS(("Marcado manual OK: %s"):format(id))
+        else
+            logW(("Fallo al marcar: %s"):format(id))
+        end
+
+    elseif args[1] == "/uncollect_fd" and args[2] then
+        local id = args[2]
+        local coll = CD_get("journal_collection") or {}
+        if coll.pets and coll.pets[id] then
+            coll.pets[id] = nil
+            if next(coll.pets) == nil then coll.pets = nil end
+            if CD_set("journal_collection", coll) then
+                if commit_collection() then
+                    logS(("Revertido y commit OK: %s"):format(id))
+                else
+                    logW("CommitCollection falló al revertir.")
+                end
+            else
+                logW("No pude escribir la reversión en ClientData.")
+            end
+        else
+            logI(("No estaba coleccionado: %s"):format(id))
+        end
+    end
+end)
+
+-- ====== Ejecución automática (lista candidatos al cargar) ======
+task.defer(function()
+    logI("Buscando id de Frost Dragon… Usa /find_fd o /autocollect_fd")
+    local list = auto_find_frost_dragon()
+    if #list > 0 then
+        logI("Posibles ids (top 6):")
+        for i=1, math.min(#list, 6) do
+            local r = list[i]
+            print(string.format("  %d) %s | name=%s | score=%d | rarity=%s",
+                i, r.kind, r.name, r.score, tostring(r.rarity)))
+        end
+        print("→ Si el correcto está arriba, ejecuta:  /collect_fd <id>")
+    else
+        logW("No se encontraron coincidencias por ahora.")
+    end
+end)
