@@ -1,0 +1,199 @@
+local __L1_OK__ = true
+
+-- LocalScript — “Max Potions to All Pets”
+-- Requisitos: Fsys en ReplicatedStorage. Coloca ESTE archivo en StarterPlayerScripts.
+
+-- util
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+if not LP then return end
+local function logI(...) print("🟢[AutoPotions]", ...) end
+local function logW(...) print("⚠️ [AutoPotions]", ...) end
+local function logS(...) print("✅[AutoPotions]", ...) end
+
+-- fsys + módulos
+local load = require(RS:WaitForChild("Fsys")).load
+local ClientData               = load("ClientData")
+local RouterClient             = load("RouterClient")
+local InventoryDB             = load("InventoryDB")
+local PetPotionEffectsDB      = load("PetPotionEffectsDB")
+local PetObjectCreatorType    = load("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+local StreamingHelper         = load("new:StreamingHelper") or { await=function(x) return x end }
+
+-- helpers de Router
+local function RC(route)
+    local r = RouterClient.get(route)
+    if not r then logW("Route no encontrada:", route) end
+    return r
+end
+local function invoke(route, ...)
+    local r = RC(route); if not r or not r.InvokeServer then return false, "route nil" end
+    local ok, res = pcall(r.InvokeServer, r, ...)
+    if not ok then return false, tostring(res) end
+    return true, res
+end
+
+-- inventario
+local function getInventorySafe()
+    local inv = ClientData.get("inventory") or {}
+    return inv
+end
+
+-- recoge TODOS los items “food” que sean POTION (según PetPotionEffectsDB)
+local function collectPotionStacks(inv)
+    local stacksByKind = {}
+    local function push(e)
+        if not e or not e.id or not e.unique then return end
+        local potionDef = PetPotionEffectsDB[e.id]
+        if not potionDef then return end -- no es poción
+        local kind = (InventoryDB.food[e.id] and InventoryDB.food[e.id].kind) or e.kind or e.id
+        stacksByKind[kind] = stacksByKind[kind] or {}
+        table.insert(stacksByKind[kind], { id=e.id, unique=e.unique, kind=kind })
+    end
+    if type(inv.food) == "table" then
+        for _,entry in pairs(inv.food) do push(entry) end
+    end
+    -- fallback por si el juego guarda food en otro sub‑tabla
+    for _,cat in pairs(inv) do
+        if type(cat)=="table" then
+            for _,entry in pairs(cat) do
+                if entry and entry.id and InventoryDB.food[entry.id] and PetPotionEffectsDB[entry.id] then
+                    push(entry)
+                end
+            end
+        end
+    end
+    return stacksByKind
+end
+
+-- lista de TODAS las pets en inventario (únicos)
+local function collectPets(inv)
+    local pets = {}
+    local function push(e)
+        if not e then return end
+        local unique = e.unique or e.pet_unique
+        if not unique then return end
+        local id = e.id or e.pet_id
+        if not id then return end
+        if InventoryDB.pets[id] then
+            table.insert(pets, { unique = unique, id = id })
+        end
+    end
+    if type(inv.pets) == "table" then
+        for _,p in pairs(inv.pets) do push(p) end
+    end
+    -- fallback si la tabla es diferente
+    for _,cat in pairs(inv) do
+        if type(cat)=="table" then
+            for _,entry in pairs(cat) do
+                if entry and (entry.pet_unique or (entry.id and InventoryDB.pets[entry.id])) then
+                    push(entry)
+                end
+            end
+        end
+    end
+    return pets
+end
+
+-- consume 1 poción (o varias si “extras” no está vacío) para una pet
+local function feedOnce(pet_unique, baseUnique, extraUniques)
+    local payload = {
+        unique_id  = baseUnique,
+        pet_unique = pet_unique,
+        additional_consume_uniques = extraUniques or {},
+    }
+    local ok, res = invoke("PetObjectAPI/CreatePetObject", PetObjectCreatorType.PetFood, payload)
+    if not ok then
+        logW("CreatePetObject fallo:", tostring(res))
+        return false
+    end
+    -- algunos servidores devuelven Instance; otros booleano/tabla — con que no explote, lo contamos como OK
+    return true
+end
+
+-- intenta vaciar todas las pociones de UN “kind” sobre una pet, respetando límites del servidor
+local function maxFeedKindForPet(petEntry, stacks)
+    local petInfo = InventoryDB.pets[petEntry.id] or {}
+    if petInfo.is_egg then
+        logW("Saltada (egg):", petEntry.unique)
+        return 0
+    end
+    if petInfo.is_doll then
+        logW("Saltada (doll):", petEntry.unique)
+        return 0
+    end
+
+    local fed = 0
+    -- consumimos de UNA EN UNA para dejar que el servidor corte cuando llegue al máximo
+    while #stacks > 0 do
+        local base = table.remove(stacks, 1)
+        local ok = feedOnce(petEntry.unique, base.unique, {}) -- sin “extras”: seguro y universal
+        if not ok then
+            -- si falla, devolvemos el stack para probar con otra pet
+            table.insert(stacks, 1, base)
+            break
+        end
+        fed += 1
+        task.wait(0.15)
+    end
+    return fed
+end
+
+-- rutina principal
+local function giveMaxPotionsToAllPets()
+    local inv = getInventorySafe()
+    local allPets = collectPets(inv)
+    local stacksByKind = collectPotionStacks(inv)
+
+    local totalPets = #allPets
+    local totalStacks = 0
+    for _,lst in pairs(stacksByKind) do totalStacks += #lst end
+
+    if totalPets == 0 then
+        logW("No hay mascotas en inventario.")
+        return
+    end
+    if totalStacks == 0 then
+        logW("No tienes pociones en el inventario.")
+        return
+    end
+
+    logI(("Mascotas: %d | Póc. totales: %d | Kinds: %d"):format(totalPets, totalStacks, (function(t) local c=0 for _ in pairs(t) do c+=1 end return c end)(stacksByKind)))
+
+    for idxPet,pet in ipairs(allPets) do
+        local beforeLeft = 0
+        for _,lst in pairs(stacksByKind) do beforeLeft += #lst end
+        if beforeLeft == 0 then
+            logI("No quedan pociones, fin.")
+            break
+        end
+
+        logI(("[%d/%d] Pet %s (%s) — aplicando máximas pociones disponibles…")
+            :format(idxPet, totalPets, tostring(pet.unique), tostring(pet.id)))
+
+        for kind, stacks in pairs(stacksByKind) do
+            if #stacks > 0 then
+                local fed = maxFeedKindForPet(pet, stacks)
+                if fed > 0 then
+                    logS(("→ %s: +%d aplicada(s) a %s"):format(kind, fed, pet.unique))
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+
+    -- refresco opcional de inventario local
+    task.wait(0.5)
+    logS("Hecho. Si aún ves pociones, el servidor limitó ese tipo para alguna pet.")
+end
+
+-- ejecuta automáticamente al cargar; puedes volver a llamar por chat: /maxpot
+task.spawn(giveMaxPotionsToAllPets)
+
+-- comando simple
+LP.Chatted:Connect(function(msg)
+    if (msg or ""):lower():match("^/maxpot") then
+        task.spawn(giveMaxPotionsToAllPets)
+    end
+end)
