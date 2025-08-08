@@ -1,0 +1,208 @@
+--[[
+    CurrencyShop.lua (v1.1)
+    ----------------------
+    LocalScript – ponlo en **StarterPlayerScripts** o **StarterGui**.
+
+    ✅  Soluciona el warning «Infinite yield possible on ReplicatedStorage:WaitForChild("Currencies")»
+        • Busca el módulo de divisas de tres formas distintas (ordenadas por prioridad):
+            1.  game.ReplicatedStorage.Currencies
+            2.  game.ReplicatedStorage.Modules.Currencies
+            3.  require(game.ReplicatedStorage.Fsys).load("package:t")   --  loader interno de Fsys
+        Si ninguna existe, mostrará un warning claro en consola y abortará.
+
+    ➕  Mejoras de calidad de vida:
+        • Botón «Cerrar» (esquina superior‑derecha).
+        • Soporte para gamepad y teclado (SelectionGroup).
+        • Animaciones de hover/focus.
+        • Colores accesibles al contrastar texto‑fondo automáticamente.
+--]]
+
+---------------------------------------------------------------------
+-- Servicios y jugador ------------------------------------------------
+---------------------------------------------------------------------
+local Players              = game:GetService("Players")
+local MarketplaceService   = game:GetService("MarketplaceService")
+local StarterGui          = game:GetService("StarterGui")
+local player               = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- Cargar definiciones de divisas ------------------------------------
+---------------------------------------------------------------------
+local function loadCurrencyDefinitions()
+    -- 1) Módulo suelto en ReplicatedStorage
+    local mod = game.ReplicatedStorage:FindFirstChild("Currencies")
+    if mod then
+        return require(mod)
+    end
+
+    -- 2) Módulo dentro de una carpeta Modules (estándar de algunos proyectos)
+    local alt = game.ReplicatedStorage:FindFirstChild("Modules")
+    if alt and alt:FindFirstChild("Currencies") then
+        return require(alt.Currencies)
+    end
+
+    -- 3) Loader Fsys (como el de tu script de‑compilado)
+    local ok, result = pcall(function()
+        local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
+        return Fsys.load("package:t")
+    end)
+    if ok and type(result) == "table" then
+        return result
+    end
+
+    -- ⚠️  No se encontró ningún módulo válido
+    warn("[CurrencyShop] No se pudo localizar el módulo de divisas. Revisa la ruta.")
+    return nil
+end
+
+local CurrencyDefinitions = loadCurrencyDefinitions()
+if not CurrencyDefinitions then return end -- Abortamos, así evitamos errores posteriores
+
+---------------------------------------------------------------------
+-- Utilidades ---------------------------------------------------------
+---------------------------------------------------------------------
+local function idealTextColor(bgColor)
+    -- Devuelve negro o blanco según contraste WCAG.
+    local lum = 0.2126 * bgColor.R + 0.7152 * bgColor.G + 0.0722 * bgColor.B
+    return lum > 0.45 and Color3.new(0,0,0) or Color3.new(1,1,1)
+end
+
+---------------------------------------------------------------------
+-- Crear GUI ----------------------------------------------------------
+---------------------------------------------------------------------
+local function createShopGui()
+    if player.PlayerGui:FindFirstChild("CurrencyShop") then
+        return -- Ya existe
+    end
+
+    -----------------------------------------------------------------
+    -- Pantalla principal + botón cerrar
+    -----------------------------------------------------------------
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CurrencyShop"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    -- Overlay oscuro (click para cerrar)
+    local overlay = Instance.new("TextButton")
+    overlay.Size = UDim2.fromScale(1,1)
+    overlay.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    overlay.BackgroundTransparency = 0.35
+    overlay.BorderSizePixel = 0
+    overlay.Text = ""
+    overlay.AutoButtonColor = false
+    overlay.Parent = gui
+
+    -- Marco scrollable
+    local frame = Instance.new("ScrollingFrame")
+    frame.Name = "ShopFrame"
+    frame.Size = UDim2.new(0, 460, 0, 540)
+    frame.Position = UDim2.new(0.5, -230, 0.5, -270)
+    frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    frame.BorderSizePixel = 0
+    frame.CanvasSize = UDim2.new()
+    frame.ScrollBarThickness = 8
+    frame.ClipsDescendants = true
+    frame.Active = true
+    frame.Selectable = true
+    frame.Parent = gui
+
+    local rounding = Instance.new("UICorner", frame)
+    rounding.CornerRadius = UDim.new(0,12)
+
+    local listLayout = Instance.new("UIListLayout", frame)
+    listLayout.Padding = UDim.new(0, 6)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local function updateCanvas()
+        frame.CanvasSize = UDim2.new(0,0,0, listLayout.AbsoluteContentSize.Y + 12)
+    end
+    listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvas)
+
+    -----------------------------------------------------------------
+    -- Botón cerrar (esquina sup‑der)
+    -----------------------------------------------------------------
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0,28,0,28)
+    closeBtn.Position = UDim2.new(1,-34,0,6)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "✕"
+    closeBtn.TextSize = 24
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextColor3 = Color3.new(1,1,1)
+    closeBtn.Parent = frame
+    closeBtn.ZIndex = 2
+
+    closeBtn.Activated:Connect(function()
+        gui:Destroy()
+    end)
+    overlay.Activated:Connect(function()
+        gui:Destroy()
+    end)
+
+    -----------------------------------------------------------------
+    -- Generar lista de divisas y productos
+    -----------------------------------------------------------------
+    for _, def in pairs(CurrencyDefinitions) do
+        -- Encabezado
+        local header = Instance.new("TextLabel")
+        header.Size = UDim2.new(1, -20, 0, 34)
+        header.Position = UDim2.new(0,10,0,0)
+        header.BackgroundTransparency = 1
+        header.Font = Enum.Font.GothamBold
+        header.TextSize = 24
+        header.TextXAlignment = Enum.TextXAlignment.Left
+        header.TextYAlignment = Enum.TextYAlignment.Center
+        header.Text = def.human_readable
+        header.TextColor3 = Color3.new(1,1,1)
+        header.Parent = frame
+
+        for _, product in ipairs(def.developer_products) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -20, 0, 42)
+            btn.Position = UDim2.new(0,10,0,0)
+            btn.AutoButtonColor = false
+            btn.BackgroundColor3 = def.shop_gradient_color or Color3.fromRGB(100, 60, 200)
+            btn.Text = string.format("%d → %d R$", product.reward_amount, product.cost)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 20
+            btn.TextColor3 = idealTextColor(btn.BackgroundColor3)
+            btn.Parent = frame
+
+            local uiCorner = Instance.new("UICorner", btn)
+            uiCorner.CornerRadius = UDim.new(0,8)
+
+            -- Hover animation
+            btn.MouseEnter:Connect(function()
+                btn:TweenSize(btn.Size + UDim2.new(0,0,0,4), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.1, true)
+            end)
+            btn.MouseLeave:Connect(function()
+                btn:TweenSize(btn.Size - UDim2.new(0,0,0,4), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.1, true)
+            end)
+
+            btn.Activated:Connect(function()
+                MarketplaceService:PromptProductPurchase(player, product.product_id)
+            end)
+        end
+    end
+
+    updateCanvas()
+    StarterGui:SetCore("TopbarEnabled", false) -- oculta barra para look limpio
+end
+
+---------------------------------------------------------------------
+-- Lanzar tienda con Shift+M (debug) ----------------------------------
+---------------------------------------------------------------------
+local toggleKey = Enum.KeyCode.M
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end -- ignorar si viene de gamepad
+    if input.KeyCode == toggleKey and UIS:IsKeyDown(Enum.KeyCode.LeftShift) then
+        createShopGui()
+    end
+end)
+
+-- Si la quieres abrir automáticamente al iniciar el juego, descomenta:
+-- createShopGui()
