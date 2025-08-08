@@ -1,0 +1,101 @@
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local player = Players.LocalPlayer
+
+-- Ajusta la ruta si tu módulo está en otro sitio
+local CurrencyDefinitions = require(game.ReplicatedStorage:WaitForChild("Currencies"))
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+
+local function rgbToColor3(c)
+    -- Si el campo ya es Color3 lo devolvemos tal cual
+    if typeof(c) == "Color3" then
+        return c
+    end
+    -- Si recibimos un número (caso de algunos placeholders) lo convertimos a un Color3 genérico
+    return Color3.new(0.25, 0.25, 0.25)
+end
+
+---------------------------------------------------------------------
+-- UI Factory
+---------------------------------------------------------------------
+
+local function createShopGui()
+    if player.PlayerGui:FindFirstChild("CurrencyShop") then
+        return -- Ya existe
+    end
+
+    -- Pantalla principal
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CurrencyShop"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    -- Contenedor con scroll
+    local frame = Instance.new("ScrollingFrame")
+    frame.Size = UDim2.new(0, 450, 1, 0)
+    frame.Position = UDim2.new(0.5, -225, 0.02, 0)
+    frame.BackgroundTransparency = 1
+    frame.CanvasSize = UDim2.new()
+    frame.ScrollBarThickness = 8
+    frame.Parent = gui
+
+    -- Diseño vertical
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.Padding = UDim.new(0, 6)
+    listLayout.Parent = frame
+
+    -- Actualiza el tamaño del scroll automáticamente
+    local function updateCanvas()
+        frame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 12)
+    end
+    listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvas)
+
+    -----------------------------------------------------------------
+    -- Generar botones divisa / producto
+    -----------------------------------------------------------------
+
+    for _, def in pairs(CurrencyDefinitions) do
+        -- Encabezado con el nombre de la divisa
+        local header = Instance.new("TextLabel")
+        header.Size = UDim2.new(1, -20, 0, 30)
+        header.Position = UDim2.new(0, 10, 0, 0)
+        header.BackgroundTransparency = 1
+        header.Font = Enum.Font.GothamBold
+        header.TextSize = 24
+        header.TextColor3 = Color3.new(1, 1, 1)
+        header.TextXAlignment = Enum.TextXAlignment.Left
+        header.Text = def.human_readable
+        header.Parent = frame
+
+        for _, product in ipairs(def.developer_products) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -20, 0, 40)
+            btn.Position = UDim2.new(0, 10, 0, 0)
+            btn.AutoButtonColor = true
+            btn.BackgroundColor3 = rgbToColor3(def.shop_gradient_color)
+            btn.TextColor3 = Color3.new(1, 1, 1)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 18
+            btn.Text = string.format("%d → %d R$", product.reward_amount, product.cost)
+            btn.Parent = frame
+
+            -- Prompt de compra
+            btn.Activated:Connect(function()
+                MarketplaceService:PromptProductPurchase(player, product.product_id)
+            end)
+        end
+    end
+
+    -- Primer cálculo del tamaño del lienzo
+    updateCanvas()
+end
+
+---------------------------------------------------------------------
+-- Ejecutar
+---------------------------------------------------------------------
+
+createShopGui()
