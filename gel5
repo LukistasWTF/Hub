@@ -1,0 +1,72 @@
+-- LocalScript: muestra un modelo que ya está en ReplicatedStorage/EggFolder
+-- Cambia modelName por el nombre exacto del modelo que quieres ver.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local EggFolder = ReplicatedStorage:WaitForChild("EggFolder")
+
+-- ============ CONFIG ============
+local modelName = "Egg1"       -- <--- cámbialo si quieres ver otro 
+local spawnCFrame = CFrame.new(0, 5, 0)     -- posición donde aparecerá
+local clearPrevious = true                  -- elimina clones previos con el mismo nombre
+-- =================================
+
+local function findTemplate(name)
+	-- Busca dentro de EggFolder; el segundo argumento true hace la búsqueda recursiva
+	local inst = EggFolder:FindFirstChild(name, true)
+	if inst and inst:IsA("Model") then
+		return inst
+	end
+	return nil
+end
+
+local function removePrevious(name)
+	for _, obj in ipairs(workspace:GetChildren()) do
+		if obj.Name == name and obj:IsA("Model") then
+			obj:Destroy()
+		end
+	end
+end
+
+local function showModel(name, cf)
+	local template = findTemplate(name)
+	if not template then
+		warn(("[EggViewer] No se encontró el modelo '%s' dentro de ReplicatedStorage/EggFolder."):format(name))
+		return
+	end
+
+	if clearPrevious then
+		removePrevious(name)
+	end
+
+	-- Clonar con pcall por si Archivable está en false o algo raro
+	local ok, clone = pcall(function()
+		return template:Clone()
+	end)
+	if not ok or not clone then
+		warn(("[EggViewer] No se pudo clonar el modelo '%s': %s"):format(name, tostring(clone)))
+		return
+	end
+
+	clone.Name = name .. "_Preview"
+	clone.Parent = workspace
+
+	-- PivotTo no requiere PrimaryPart
+	local pivotOK, err = pcall(function()
+		clone:PivotTo(cf)
+	end)
+	if not pivotOK then
+		-- Fallback simple: intenta establecer PrimaryPart si existe alguna BasePart
+		local anyPart = clone:FindFirstChildWhichIsA("BasePart", true)
+		if anyPart then
+			clone.PrimaryPart = anyPart
+			clone:SetPrimaryPartCFrame(cf)
+		else
+			warn("[EggViewer] No se pudo posicionar el modelo (no tiene partes físicas).")
+		end
+	end
+
+	print(("[EggViewer] Mostrado '%s' en workspace."):format(name))
+end
+
+-- Ejecuta
+showModel(modelName, spawnCFrame)
