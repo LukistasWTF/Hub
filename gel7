@@ -1,0 +1,204 @@
+-- LocalScript: “añadir” pets visualmente (solo cliente)
+-- Colócalo en StarterPlayerScripts. No replica ni persiste.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ========= CONFIG =========
+local CATEGORY  = "pets"                        -- tipo
+local KIND      = "shadow_dragon"    -- or nil si usas MODEL
+local MODEL     = nil                            -- p.ej. "AztecEgg2025Tegu"
+local SPAWN_CF  = CFrame.new(0, 5, 0)           -- posición de spawn
+local CLEAR_OLD = false                          -- borrar previas
+-- ==========================
+
+-- Dependencias del juego
+local Fsys = require(ReplicatedStorage:WaitForChild("Fsys")).load
+local InventoryDB = Fsys("InventoryDB")   -- categorías -> kinds -> entry
+local KindDB = Fsys("KindDB")             -- kind -> entry
+local EggFolder = ReplicatedStorage:WaitForChild("EggFolder")
+
+-- Mapa opcional de animaciones: intenta cargar un módulo con tu tabla de IDs
+local AnimIdMap do
+	local ok, mod = pcall(function()
+		local m = ReplicatedStorage:FindFirstChild("AztecAnimIds")
+		return m and require(m)
+	end)
+	AnimIdMap = ok and mod or nil
+end
+
+-- Utilidades
+local function normCategory(c) return tostring(c or ""):lower() end
+local function info(fmt, ...) print(("[VisualPets] "..fmt):format(...)) end
+local function warnf(fmt, ...) warn(("[VisualPets] "..fmt):format(...)) end
+
+local function findEntryByKind(category, kind)
+	category = normCategory(category)
+	if not (category and kind) then return nil end
+	local e = KindDB[kind]
+	if e and e.category == category then return e end
+	local catTable = InventoryDB[category]
+	return catTable and catTable[kind] or nil
+end
+
+local function findEntryByModel(category, modelName)
+	category = normCategory(category)
+	if not (category and modelName) then return nil end
+	local catTable = InventoryDB[category]
+	if not catTable then return nil end
+	for _, entry in pairs(catTable) do
+		if entry and entry.model == modelName then
+			return entry
+		end
+	end
+	return nil
+end
+
+local function resolveEntry(category, kind, model)
+	return (kind and findEntryByKind(category, kind))
+	    or (model and findEntryByModel(category, model))
+end
+
+local function ensureLocalFolder()
+	local f = workspace:FindFirstChild("LocalPets")
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = "LocalPets"
+		f.Parent = workspace
+	end
+	return f
+end
+
+local function playIdleAnimation(model, entry)
+	if not AnimIdMap then
+		info("Sin mapa de animaciones (AztecAnimIds). Solo se mostrará el modelo.")
+		return
+	end
+	if not entry or not entry.anims then return end
+
+	-- Busca el nombre de la anim idle en la entrada (puede ser string o subtabla)
+	local idleName = entry.anims.idle or entry.anims.Idle or entry.anims["idle"]
+	if not idleName then return end
+
+	local animId = AnimIdMap[idleName]
+	if not animId then
+		info("No encontré AssetId para anim '%s'.", tostring(idleName))
+		return
+	end
+
+	-- Asegura AnimationController/Animator
+	local ac = model:FindFirstChildWhichIsA("AnimationController", true)
+	if not ac then
+		ac = Instance.new("AnimationController")
+		ac.Name = "LocalAnimController"
+		ac.Parent = model
+	end
+	local animator = ac:FindFirstChildOfClass("Animator") or Instance.new("Animator", ac)
+
+	local anim = Instance.new("Animation")
+	anim.AnimationId = "rbxassetid://"..tostring(animId)
+	anim.Name = idleName
+	local track
+	local ok, err = pcall(function()
+		track = animator:LoadAnimation(anim)
+	end)
+	if not ok or not track then
+		warnf("Error cargando anim '%s': %s", idleName, tostring(err))
+		return
+	end
+	track.Looped = true
+	track:Play(0.1)
+end
+
+local function pivotToSafe(model, cf)
+	-- Intenta PivotTo; si falla, usa PrimaryPart o cualquier BasePart
+	local ok = pcall(function() model:PivotTo(cf) end)
+	if ok then return end
+	local anyPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+	if anyPart then
+		model.PrimaryPart = anyPart
+		model:SetPrimaryPartCFrame(cf)
+	end
+end
+
+local function spawnVisualPet(entry)
+	local template = EggFolder:FindFirstChild(entry.model, true)
+	if not template or not template:IsA("Model") then
+		return nil, ("No encontré el modelo '%s' en ReplicatedStorage/EggFolder."):format(tostring(entry.model))
+	end
+
+	if CLEAR_OLD then
+		local bucket = workspace:FindFirstChild("LocalPets")
+		if bucket then
+			for _, obj in ipairs(bucket:GetChildren()) do
+				if obj:IsA("Model") then obj:Destroy() end
+			end
+		end
+	end
+
+	local clone = template:Clone()
+	clone.Name = (entry.name or entry.kind or "Pet").."_Local"
+	clone.Parent = ensureLocalFolder()
+
+	-- Colocar cerca del jugador si tenemos HRP
+	local cf = SPAWN_CF
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		cf = hrp.CFrame * CFrame.new(0, 0, -6) * CFrame.Angles(0, math.rad(180), 0)
+	end
+	pivotToSafe(clone, cf)
+
+	-- Reproducir anim idle (si hay IDs)
+	playIdleAnimation(clone, entry)
+
+	-- Etiqueta visual opcional
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.new(0, 200, 0, 36)
+	billboard.StudsOffset = Vector3.new(0, 4, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Name = "LocalLabel"
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1,1)
+	label.TextScaled = true
+	label.Text = string.format("%s (visual)", entry.name or entry.kind)
+	label.Parent = billboard
+
+	local attach = clone:FindFirstChildWhichIsA("BasePart", true)
+	if attach then
+		billboard.Parent = attach
+	else
+		billboard.Parent = clone
+	end
+
+	return clone
+end
+
+local function addVisualPet(category, kind, model)
+	local entry = resolveEntry(category, kind, model)
+	if not entry then
+		warnf("No pude resolver la entry para category='%s', kind='%s', model='%s'", tostring(category), tostring(kind), tostring(model))
+		return
+	end
+	local pet, err = spawnVisualPet(entry)
+	if pet then
+		info("Mostrando '%s' (%s) solo en tu cliente.", tostring(entry.name or entry.kind), tostring(entry.model))
+	else
+		warnf("Falló el spawn: %s", tostring(err))
+	end
+end
+
+-- Ejecuta con la config de arriba
+addVisualPet(CATEGORY, KIND, MODEL)
+
+-- Ejemplo: teclear V para spawnear otra vez rápido
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.V then
+		addVisualPet(CATEGORY, KIND, MODEL)
+	end
+end)
