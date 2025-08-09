@@ -1,0 +1,87 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+
+-- RemoteFunction que el servidor expone para "reclamar" el BeesBlaster
+local claimRF = ReplicatedStorage:WaitForChild("ClaimBeesBlaster")
+
+-- Intentamos cargar el enum desde un módulo; si no existe, usamos fallback
+local ClaimEnum
+do
+	local ok, mod = pcall(function()
+		-- Ajusta la ruta a donde tengas el módulo
+		-- Por ejemplo: ReplicatedStorage:WaitForChild("Modules"):WaitForChild("ClaimBeesBlasterResult")
+		local modules = ReplicatedStorage:FindFirstChild("Modules")
+		if modules and modules:FindFirstChild("ClaimBeesBlasterResult") then
+			return require(modules.ClaimBeesBlasterResult)
+		end
+		-- fallback si no existe módulo
+		return {
+			DoesNotOwnAsset = 1;
+			AlreadyClaimed  = 2;
+			ClaimSuccessful = 3;
+			BackendError    = 4;
+		}
+	end)
+	ClaimEnum = ok and mod or {
+		DoesNotOwnAsset = 1;
+		AlreadyClaimed  = 2;
+		ClaimSuccessful = 3;
+		BackendError    = 4;
+	}
+end
+
+-- Pequeña utilidad para mostrar mensajes al jugador
+local function notify(msg)
+	-- Si usas algún sistema de notificaciones propio, cámbialo aquí.
+	-- Por defecto: mensaje en el output del cliente y en el chat del sistema.
+	print("[BeesBlaster] " .. msg)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("ChatMakeSystemMessage", {
+			Text = "[BeesBlaster] " .. msg;
+		})
+	end)
+end
+
+local busy = false
+local function claimBeesBlaster()
+	if busy then return end
+	busy = true
+	notify("Solicitando BeesBlaster...")
+
+	local ok, resultOrErr = pcall(function()
+		-- Puedes pasar datos si hace falta (p.ej. un código o idioma)
+		return claimRF:InvokeServer()
+	end)
+
+	if not ok then
+		notify("Error al contactar con el servidor: " .. tostring(resultOrErr))
+		busy = false
+		return
+	end
+
+	local result = resultOrErr
+	if result == ClaimEnum.ClaimSuccessful then
+		notify("¡BeesBlaster entregado correctamente! 🐝🔫")
+	elseif result == ClaimEnum.AlreadyClaimed then
+		notify("Ya habías reclamado el BeesBlaster.")
+	elseif result == ClaimEnum.DoesNotOwnAsset then
+		notify("No cumples los requisitos para obtener el BeesBlaster (no posees el asset/vinculación).")
+	elseif result == ClaimEnum.BackendError then
+		notify("Hubo un error en el backend al intentar darte el BeesBlaster. Intenta de nuevo más tarde.")
+	else
+		notify("Respuesta desconocida del servidor: " .. tostring(result))
+	end
+
+	busy = false
+end
+
+-- Opción A: tecla B para reclamar
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.B then
+		claimBeesBlaster()
+	end
+end)
