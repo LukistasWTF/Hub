@@ -1,0 +1,499 @@
+-- Minigames Hub (Sección: RuinRush) · LocalScript
+-- Colocar en StarterPlayerScripts
+
+--== Servicios
+local Players, RS, RunService, StarterGui, UIS, VU =
+	game:GetService("Players"), game:GetService("ReplicatedStorage"),
+	game:GetService("RunService"), game:GetService("StarterGui"),
+	game:GetService("UserInputService"), game:GetService("VirtualUser")
+
+local LP = Players.LocalPlayer
+
+--== Mensajes rápidos
+local function say(msg)
+	print("[Hub] "..msg)
+	pcall(function() StarterGui:SetCore("ChatMakeSystemMessage",{Text="[Hub] "..msg}) end)
+end
+
+--== Fsys / Roact (si no están, la UI no se monta pero la lógica puede correr)
+local Fsys; do
+	local ok,res = pcall(function() return require(RS:WaitForChild("Fsys")) end)
+	if ok then Fsys = res end
+end
+local Roact = Fsys and (pcall(function() return Fsys.load("Roact") end)) and Fsys.load("Roact") or nil
+
+--== Helpers generales
+local function getHRP()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	return ch:WaitForChild("HumanoidRootPart"), ch:WaitForChild("Humanoid")
+end
+local function formatClock(sec)
+	sec = math.max(0, math.floor(sec)); return ("%02d:%02d"):format(math.floor(sec/60), sec%60)
+end
+
+--==============================================================================
+--                              RUINRUSH · LÓGICA
+--==============================================================================
+
+-- NOTA: NO usamos InteriorsM ni DoorsClient.
+local ForcedState = Fsys and (pcall(function() return Fsys.load("MinigameForcedState") end)) and Fsys.load("MinigameForcedState") or nil
+local KillInterior = Fsys and (pcall(function() return Fsys.load("KillBlockInteriorManager") end)) and Fsys.load("KillBlockInteriorManager") or nil
+
+local RR = {}  -- namespace RuinRush
+
+--------------------------------------------------------------------------------
+-- Teleport local a AztecLobby SIN InteriorsM
+--------------------------------------------------------------------------------
+
+-- Busca la puerta MainDoor cuyo destination_id sea AztecLobby;
+-- también contempla Interiors/*/Buildings/AztecLobby/Doors/MainDoor
+function RR.findAztecDoor()
+	local root = workspace:FindFirstChild("Interiors")
+	if not root then return end
+
+	for _,container in ipairs(root:GetChildren()) do
+		-- 1) Interiors/*/Doors/*
+		local doors = container:FindFirstChild("Doors")
+		if doors then
+			for _,d in ipairs(doors:GetChildren()) do
+				if d:IsA("Model") and d.Name=="MainDoor" then
+					local wp = d:FindFirstChild("WorkingParts")
+					local cfg = wp and wp:FindFirstChild("Configuration")
+					local dest = cfg and cfg:FindFirstChild("destination_id")
+					if dest and tostring(dest.Value)=="AztecLobby" then
+						return d
+					end
+				end
+			end
+		end
+		-- 2) Interiors/*/Buildings/AztecLobby/Doors/MainDoor
+		local b = container:FindFirstChild("Buildings")
+		if b and b:FindFirstChild("AztecLobby") then
+			local bd = b.AztecLobby
+			if bd:FindFirstChild("Doors") and bd.Doors:FindFirstChild("MainDoor") then
+				return bd.Doors.MainDoor
+			end
+		end
+	end
+end
+
+-- Busca un SpawnPoint útil dentro del mismo interior de la puerta
+local function findSpawnForDoor(doorModel)
+	if not (doorModel and doorModel.Parent) then return end
+	local n = doorModel
+	while n and not (n:FindFirstChild("SpawnPoints")) do
+		n = n.Parent
+	end
+	if n and n:FindFirstChild("SpawnPoints") then
+		local spFolder = n.SpawnPoints
+		local candidate = spFolder:FindFirstChild("1")
+		if candidate and candidate:IsA("BasePart") then return candidate.CFrame end
+		for _,c in ipairs(spFolder:GetChildren()) do
+			if c:IsA("BasePart") then return c.CFrame end
+		end
+	end
+end
+
+-- Comprueba que haya hueco para colocar al jugador
+local function isFreeBox(cf)
+	local parts = workspace:GetPartBoundsInBox(cf, Vector3.new(3,6,3))
+	local solid = 0
+	for _,p in ipairs(parts) do
+		if p.CanCollide and p.Transparency < 0.98 then solid += 1 end
+	end
+	return solid <= 6
+end
+
+-- Calcula un CFrame "del lado de adentro" usando TouchToEnter si no hay SpawnPoints
+local function computeInsideFromTouch(touch)
+	local origin = touch.CFrame
+	local look   = origin.LookVector
+	local up     = Vector3.new(0,2,0)
+	local dirs = { look, -look } -- probamos ambos lados por si el LookVector da hacia afuera
+
+	for _,dir in ipairs(dirs) do
+		for dist=6,12,2 do
+			local p = origin.Position + up + dir*dist
+			local cf = CFrame.new(p, p + dir)
+			if isFreeBox(cf) then return cf end
+		end
+	end
+	return origin + up
+end
+
+-- Teleport local seguro (desancla, sale de asiento, pide streaming y mueve HRP)
+local function tpTo(cf)
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	local hum = ch:FindFirstChildOfClass("Humanoid")
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp then return false end
+
+	if hum.Sit then
+		hum.Sit = false; hum.Jump = true
+		local weld = hum.SeatPart and hum.SeatPart:FindFirstChild("SeatWeld")
+		if weld then weld:Destroy() end
+		task.wait(0.2)
+	end
+
+	pcall(function() LP:RequestStreamAroundAsync(cf.Position, 2) end)
+	hrp.Anchored = false
+	hrp.CFrame = cf
+	return true
+end
+
+-- Entrada a AztecLobby SIN InteriorsM
+function RR.enterAztecLobby()
+	local door = RR.findAztecDoor()
+	if not door then
+		say("[RuinRush] No encuentro la MainDoor de AztecLobby.")
+		return false
+	end
+
+	local wp = door:FindFirstChild("WorkingParts")
+	local touch = wp and wp:FindFirstChild("TouchToEnter")
+	if not touch then
+		say("[RuinRush] La puerta no tiene TouchToEnter.")
+		return false
+	end
+
+	say("[RuinRush] Intentando entrar a 'AztecLobby' por MainDoor…")
+
+	local spawnCF = findSpawnForDoor(door)
+	if not spawnCF then
+		spawnCF = computeInsideFromTouch(touch)
+	end
+
+	return tpTo(spawnCF)
+end
+
+-- Heurística: ¿parece que ya estamos dentro del templo?
+local function looksLikeAztecInside()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	local here = workspace:GetPartBoundsInRadius(hrp.Position, 80)
+	for _,p in ipairs(here) do
+		local n = string.lower(p.Parent and p.Parent.Name or p.Name)
+		if n:find("aztec") or n:find("temple") or n:find("ruin") then
+			return true
+		end
+	end
+	return false
+end
+
+function RR.ensureInsideRuinRush()
+	if looksLikeAztecInside() then return true end
+	return RR.enterAztecLobby()
+end
+
+--------------------------------------------------------------------------------
+-- Resto de helpers RuinRush
+--------------------------------------------------------------------------------
+
+function RR.findExitDoor()
+	local best,scoreBest
+	for _,inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name=="ExitDoor" then
+			local s, p = 0, inst.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("ruinrush") or n:find("temple") or n:find("interior") then s+=3 end
+				if p:FindFirstChild("AttachmentPoints") then s+=2 end
+				if p:FindFirstChild("SpawnPoints") then s+=1 end
+				p = p.Parent
+			end
+			if not best or s>scoreBest then best,scoreBest = inst,s end
+		end
+	end
+	return best
+end
+
+function RR.findSafeSpawn()
+	for _,f in ipairs(workspace:GetDescendants()) do
+		if f:IsA("Folder") and f.Name=="SpawnPoints" and #f:GetChildren()>0 then
+			local sp = f:FindFirstChild("1") or f:GetChildren()[1]
+			if sp and sp:IsA("BasePart") then return sp end
+		end
+	end
+end
+
+function RR.sweepThrough(part)
+	if not part or not part.Parent then return end
+	local hrp,hum = getHRP(); hum:ChangeState(Enum.HumanoidStateType.Running); hrp.Anchored=false
+	local base,size,up = part.CFrame, part.Size, Vector3.new(0,1,0)
+	local a = base.Position + up*(size.Y*0.5) - base.LookVector*(size.Z+4)
+	local b = base.Position + up*(size.Y*0.5) + base.LookVector*(size.Z+4)
+	for i=0,12 do
+		local pos = a:Lerp(b, i/12)
+		hrp.CFrame = CFrame.new(pos, pos + base.LookVector)
+		RunService.Heartbeat:Wait()
+	end
+end
+
+function RR.touchModel(model)
+	if not model or not model.Parent then return end
+	local primary = model.PrimaryPart
+	if not primary then
+		for _,d in ipairs(model:GetDescendants()) do if d:IsA("BasePart") then primary=d; break end end
+	end
+	if primary then RR.sweepThrough(primary) end
+end
+
+function RR.findPedestalSkull()
+	local best,bscore
+	for _,m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name=="GoldenSkull" then
+			local s,p = 0,m.Parent
+			while p do
+				local n=string.lower(p.Name)
+				if n:find("pedastal") or n:find("uplift") then s+=4 end
+				if n:find("ruinrush") or n:find("temple") then s+=2 end
+				p=p.Parent
+			end
+			if not best or s>bscore then best,bscore=m,s end
+		end
+	end
+	return best
+end
+
+function RR.findRealSkulls()
+	local list={}
+	for _,m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name=="GoldenSkull" then
+			local p=m.Parent; local ok=false
+			while p do
+				if p:IsA("Folder") and p.Name=="PickupEntities" then ok=true; break end
+				p=p.Parent
+			end
+			if ok then table.insert(list,m) end
+		end
+	end
+	return list
+end
+
+function RR.safeOn()
+	if ForcedState and type(ForcedState.set_buff)=="function" then pcall(function() ForcedState.set_buff("rr_safe",{walk_speed=22,jump_power=0}) end) end
+	local sp = RR.findSafeSpawn()
+	if sp and KillInterior and type(KillInterior.set_spawn_point)=="function" then pcall(function() KillInterior.set_spawn_point(sp) end) end
+end
+function RR.safeOff()
+	if ForcedState and type(ForcedState.remove_buff)=="function" then pcall(function() ForcedState.remove_buff("rr_safe") end) end
+end
+
+function RR.ensureChaseStarted(timeout)
+	timeout = timeout or 15
+	local t0 = os.clock()
+	local ped = RR.findPedestalSkull()
+	if ped then
+		say("RuinRush: activando pedestal…")
+		RR.touchModel(ped)
+		while os.clock()-t0 < timeout do RunService.Heartbeat:Wait() end
+	end
+end
+
+function RR.collectAll(maxPasses, perPassWait, progressCb)
+	maxPasses, perPassWait = maxPasses or 4, perPassWait or 1.2
+	local collected = 0
+	for pass=1,maxPasses do
+		local skulls = RR.findRealSkulls()
+		if progressCb then progressCb(("Ronda %d: %d skulls"):format(pass,#skulls)) end
+		if #skulls==0 then if pass==1 then RunService.Heartbeat:Wait() else break end end
+		for _,s in ipairs(skulls) do
+			if s and s.Parent then RR.touchModel(s); collected+=1; RunService.Heartbeat:Wait(); if progressCb then progressCb(nil,collected) end end
+		end
+		task.wait(perPassWait)
+	end
+	return collected
+end
+
+function RR.exit()
+	local door = RR.findExitDoor()
+	if not door then say("RuinRush: no veo ExitDoor aún."); return false end
+	RR.sweepThrough(door); return true
+end
+
+function RR.runAuto(onStep,onProgress)
+	-- 1) Garantizar interior AztecLobby sin InteriorsM
+	if not RR.ensureInsideRuinRush() then
+		say("RuinRush: no se pudo entrar a AztecLobby. Cancelado.")
+		return
+	end
+
+	-- 2) Ya dentro, activamos “modo seguro” y seguimos como siempre
+	RR.safeOn(); task.wait(1.2)
+	if onStep then onStep("start") end
+	RR.ensureChaseStarted(6)
+	if onStep then onStep("collect") end
+	local got = RR.collectAll(5,1.2,onProgress)
+	if got>0 then say(("RuinRush: %d skulls recogidas."):format(got)) end
+	if onStep then onStep("exit") end
+	RR.exit()
+	RR.safeOff()
+	if onStep then onStep("done") end
+end
+
+-- Atajos siguen activos
+UIS.InputBegan:Connect(function(input,gp)
+	if gp then return end
+	if input.KeyCode==Enum.KeyCode.G then RR.safeOn(); local n=RR.collectAll(5,1.2); RR.safeOff(); say("RuinRush G: "..(n or 0).." skulls") end
+	if input.KeyCode==Enum.KeyCode.K then RR.safeOn(); RR.exit(); RR.safeOff() end
+end)
+
+--==============================================================================
+--                                 UI · HUB
+--==============================================================================
+if not Roact then
+	say("Falta Roact: el Hub visual no se montará (la lógica funciona).")
+	return
+end
+
+------------- RuinRush Panel (UI específica de la sección)
+local RRPanel = Roact.Component:extend("RRPanel")
+function RRPanel:init()
+	self.state = { running=false, step="idle", status="Listo", progress=0, collected=0, timer=0, log={} }
+	self.timer = RunService.Heartbeat:Connect(function(dt) if self.state.running then self:setState({timer=self.state.timer+dt}) end end)
+end
+function RRPanel:willUnmount() if self.timer then self.timer:Disconnect() end end
+function RRPanel:pushLog(t) local copy=table.clone(self.state.log); table.insert(copy,1,t); if #copy>7 then copy[#copy]=nil end; self:setState({log=copy}) end
+function RRPanel:run()
+	if self.state.running then return end
+	self:setState({running=true, step="start", status="Iniciando…", timer=0, collected=0, progress=0}); self:pushLog("▶ Auto Run")
+	task.spawn(function()
+		local function onStep(st)
+			if     st=="start"   then self:setState({step="start",   status="Activando pedestal…"}); self:pushLog("Pedestal…")
+			elseif st=="collect" then self:setState({step="collect", status="Recogiendo skulls…"}); self:pushLog("Skulls…")
+			elseif st=="exit"    then self:setState({step="exit",    status="Saliendo…"});         self:pushLog("Salida…")
+			elseif st=="done"    then self:setState({step="done",    status="Hecho!"});            self:pushLog("✔ Terminado")
+			end
+		end
+		local function onProg(_,c) if c then self:setState({collected=c, progress=math.clamp(c/3,0,1)}) end end
+		RR.runAuto(onStep,onProg)
+		self:setState({running=false})
+	end)
+end
+function RRPanel:collectOnly()
+	if self.state.running then return end
+	self:setState({running=true, step="collect", status="Recogiendo…", timer=0, collected=0, progress=0}); self:pushLog("▶ Solo Skulls")
+	task.spawn(function()
+		if not RR.ensureInsideRuinRush() then self:setState({running=false, status="Listo"}); self:pushLog("No pude entrar"); return end
+		RR.safeOn()
+		local n = RR.collectAll(5,1.2,function(_,c) if c then self:setState({collected=c,progress=math.clamp(c/3,0,1)}) end end)
+		RR.safeOff()
+		self:pushLog("Skulls: "..tostring(n)); self:setState({running=false, status="Listo"})
+	end)
+end
+function RRPanel:exitOnly()
+	if self.state.running then return end
+	self:setState({running=true, step="exit", status="Saliendo…", timer=0}); self:pushLog("▶ Salir")
+	task.spawn(function()
+		if not RR.ensureInsideRuinRush() then self:setState({running=false, status="Listo"}); self:pushLog("No pude entrar"); return end
+		RR.safeOn(); RR.exit(); RR.safeOff(); self:setState({running=false, status="Listo"})
+	end)
+end
+function RRPanel:render()
+	local s=self.state
+	return Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0)},{
+		UIList = Roact.createElement("UIListLayout",{Padding=UDim.new(0,10)}),
+
+		Title = Roact.createElement("TextLabel",{Text="Temple Trek • RuinRush",Font=Enum.Font.GothamBold,TextSize=20,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,24)}),
+
+		Btns = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,40)},{
+			H = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8)}),
+			B1 = Roact.createElement("TextButton",{Text=s.running and ("Ejecutando… "..formatClock(s.timer)) or "▶ Auto Run",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=s.running and Color3.fromRGB(80,80,120) or Color3.fromRGB(70,120,200),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.34,-5,1,0),[Roact.Event.Activated]=function() self:run() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			B2 = Roact.createElement("TextButton",{Text="💎 Solo Skulls (G)",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.33,-5,1,0),[Roact.Event.Activated]=function() self:collectOnly() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			B3 = Roact.createElement("TextButton",{Text="🚪 Salir (K)",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=Color3.fromRGB(180,60,60),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.33,0,1,0),[Roact.Event.Activated]=function() self:exitOnly() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+		}),
+
+		ProgBG = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(50,50,50),BorderSizePixel=0,Size=UDim2.new(1,0,0,14)},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}),Fill=Roact.createElement("Frame",{Size=UDim2.new(s.progress,0,1,0),BackgroundColor3=Color3.fromRGB(80,200,100),BorderSizePixel=0},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})})}),
+		Status = Roact.createElement("TextLabel",{Text=("Estado: %s"):format(s.status),Font=Enum.Font.Gotham,TextSize=16,BackgroundTransparency=1,TextColor3=Color3.fromRGB(220,220,220),Size=UDim2.new(1,0,0,18)}),
+
+		LogBox = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(40,40,40),BorderSizePixel=0,Size=UDim2.new(1,0,1,-96)},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),Pad=Roact.createElement("UIPadding",{PaddingTop=UDim.new(0,8),PaddingLeft=UDim.new(0,8)}),List=Roact.createElement("UIListLayout",{Padding=UDim.new(0,6)}),
+			L1=Roact.createElement("TextLabel",{Text=s.log[1] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,-16,0,18)}),
+			L2=Roact.createElement("TextLabel",{Text=s.log[2] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,18)}),
+			L3=Roact.createElement("TextLabel",{Text=s.log[3] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(180,180,180),Size=UDim2.new(1,-16,0,18)}),
+			L4=Roact.createElement("TextLabel",{Text=s.log[4] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(160,160,160),Size=UDim2.new(1,-16,0,18)}),
+		})
+	})
+end
+
+------------- HUB raíz (sidebar con secciones)
+local Hub = Roact.Component:extend("MinigamesHub")
+function Hub:init()
+	self.state = { showUI=true, pos=UDim2.new(0.5,-340,0.55,-190), dragging=false, dragOffset=Vector2.zero, antiAFK=false, active="RuinRush" }
+end
+function Hub:willUnmount() if self.afkConn then self.afkConn:Disconnect() end end
+function Hub:startDrag(io) self:setState({dragging=true, dragOffset=(io.Position-Vector3.new(self.ref.AbsolutePosition.X,self.ref.AbsolutePosition.Y,0)).XY}) end
+function Hub:doDrag(io) if self.state.dragging then local np=(io.Position-Vector3.new(0,0,0)).XY-self.state.dragOffset; self:setState({pos=UDim2.new(0,np.X,0,np.Y)}) end end
+function Hub:stopDrag() self:setState({dragging=false}) end
+function Hub:toggleAntiAFK()
+	if not self.state.antiAFK then
+		self.afkConn = Players.LocalPlayer.Idled:Connect(function() VU:CaptureController(); VU:ClickButton2(Vector2.zero) end)
+	else
+		if self.afkConn then self.afkConn:Disconnect(); self.afkConn=nil end
+	end
+	self:setState({antiAFK=not self.state.antiAFK})
+end
+
+-- Registro de minijuegos (agrega más aquí en el futuro)
+local MINIGAMES = {
+	{ id="RuinRush", title="RuinRush", Component=RRPanel },
+}
+
+function Hub:render()
+	local s=self.state
+
+	-- Sidebar items
+	local sideChildren = {
+		Layout = Roact.createElement("UIListLayout",{Padding=UDim.new(0,6)})
+	}
+	for _,mg in ipairs(MINIGAMES) do
+		sideChildren["btn_"..mg.id] = Roact.createElement("TextButton",{
+			Text = (s.active==mg.id and "▶ " or "") .. mg.title,
+			Font=Enum.Font.GothamBold,TextSize=16,
+			BackgroundColor3 = (s.active==mg.id) and Color3.fromRGB(70,120,200) or Color3.fromRGB(55,55,55),
+			TextColor3=Color3.new(1,1,1), BorderSizePixel=0, Size=UDim2.new(1,0,0,36),
+			[Roact.Event.Activated]=function() self:setState({active=mg.id}) end,
+		},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})})
+	end
+
+	-- Content (solo muestra el activo)
+	local contentChildren = { Layout=Roact.createElement("UIListLayout",{Padding=UDim.new(0,0)}) }
+	for _,mg in ipairs(MINIGAMES) do
+		contentChildren["panel_"..mg.id] = Roact.createElement("Frame",{Visible=(s.active==mg.id), BackgroundTransparency=1, Size=UDim2.new(1,0,1,0)},{
+			Panel = Roact.createElement(mg.Component)
+		})
+	end
+
+	return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+		Toggle = Roact.createElement("TextButton",{Text=":D",Font=Enum.Font.GothamBold,TextSize=22,BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,10),ZIndex=5,[Roact.Event.Activated]=function() self:setState({showUI=not s.showUI}) end}),
+		Main = Roact.createElement("Frame",{
+			Visible=s.showUI, Size=UDim2.new(0,680,0,380), Position=s.pos,
+			BackgroundColor3=Color3.fromRGB(30,30,30), BorderSizePixel=0,
+			[Roact.Ref]=function(r) self.ref=r end,
+			[Roact.Event.InputBegan]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:startDrag(io) end end,
+			[Roact.Event.InputChanged]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseMovement then self:doDrag(io) end end,
+			[Roact.Event.InputEnded]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:stopDrag() end end,
+		},{
+			UIC = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+			Header = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,48)},{
+				Title = Roact.createElement("TextLabel",{Text="Minigames Hub",Font=Enum.Font.GothamBold,TextSize=20,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(0.6,0,1,0),Position=UDim2.new(0,14,0,0),TextXAlignment=Enum.TextXAlignment.Left}),
+				Anti = Roact.createElement("TextButton",{Text=s.antiAFK and "🟢 Anti-AFK ON" or "⚪ Anti-AFK",Font=Enum.Font.GothamBold,TextSize=16,BackgroundColor3=s.antiAFK and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0,150,0,32),Position=UDim2.new(1,-164,0,8),[Roact.Event.Activated]=function() self:toggleAntiAFK() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			}),
+			Sep = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(55,55,55),BorderSizePixel=0,Size=UDim2.new(1,-20,0,1),Position=UDim2.new(0,10,0,48)}),
+
+			Body = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,-20,1,-62),Position=UDim2.new(0,10,0,58)},{
+				Layout = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,10)}),
+
+				-- Sidebar
+				Side = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(35,35,35),BorderSizePixel=0,Size=UDim2.new(0,170,1,0)}, sideChildren),
+
+				-- Content
+				Content = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,-180,1,0)}, contentChildren),
+			})
+		})
+	})
+end
+
+-- Montar
+Roact.mount(Roact.createElement(Hub), LP:WaitForChild("PlayerGui"))
