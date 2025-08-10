@@ -1,0 +1,269 @@
+-- LocalScript: Autocompletar RuinRush con recolección de TODAS las Golden Skulls
+-- Colocar en: StarterPlayerScripts
+-- Flujo:
+-- 1) Activa el pedestal (skull falsa) => rompe suelo e inicia boulder.
+-- 2) Recolecta todas las GoldenSkull reales (pickup entities).
+-- 3) Toca la ExitDoor para finalizar.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+
+local LP = Players.LocalPlayer
+
+-- Intenta usar tus módulos si existen (no es obligatorio para funcionar)
+local function tryLoad(mod)
+	local ok, res = pcall(function()
+		local fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
+		return fsys.load(mod)
+	end)
+	return ok and res or nil
+end
+
+local ForcedState = tryLoad("MinigameForcedState")
+local KillInterior = tryLoad("KillBlockInteriorManager")
+
+local function say(msg)
+	print("[RuinRushAuto] " .. msg)
+	pcall(function()
+		StarterGui:SetCore("ChatMakeSystemMessage", { Text = "[RuinRushAuto] " .. msg })
+	end)
+end
+
+local function getHRP()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	return ch:WaitForChild("HumanoidRootPart"), ch:WaitForChild("Humanoid")
+end
+
+-- Encuentra la ExitDoor “más probable” del interior
+local function findExitDoor()
+	local best, bestScore
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name == "ExitDoor" then
+			local score, p = 0, inst.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("ruinrush") or n:find("temple") or n:find("interior") then score += 3 end
+				if p:FindFirstChild("AttachmentPoints") then score += 2 end
+				if p:FindFirstChild("SpawnPoints") then score += 1 end
+				p = p.Parent
+			end
+			if not best or score > bestScore then
+				best, bestScore = inst, score
+			end
+		end
+	end
+	return best
+end
+
+-- Heurística: spawn seguro (si existe un Folder "SpawnPoints" con nombres numéricos)
+local function findSafeSpawn()
+	for _, f in ipairs(workspace:GetDescendants()) do
+		if f:IsA("Folder") and f.Name == "SpawnPoints" and #f:GetChildren() > 0 then
+			local sp = f:FindFirstChild("1") or f:GetChildren()[1]
+			if sp and sp:IsA("BasePart") then return sp end
+		end
+	end
+	return nil
+end
+
+-- Desplaza el HRP a través de una pieza para disparar Touch
+local function sweepThrough(part)
+	local hrp, hum = getHRP()
+	hum:ChangeState(Enum.HumanoidStateType.Running)
+	hrp.Anchored = false
+
+	local base = part.CFrame
+	local size = part.Size
+	local up = Vector3.new(0,1,0)
+	local startPos = base.Position + up*(size.Y*0.5) - base.LookVector*(size.Z + 4)
+	local endPos   = base.Position + up*(size.Y*0.5) + base.LookVector*(size.Z + 4)
+
+	for i=0,12 do
+		local t = i/12
+		local pos = startPos:Lerp(endPos, t)
+		hrp.CFrame = CFrame.new(pos, pos + base.LookVector)
+		RunService.Heartbeat:Wait()
+	end
+end
+
+-- “Toca” el modelo pasando por su PrimaryPart o primer BasePart
+local function touchModel(model)
+	local primary = model.PrimaryPart
+	if not primary then
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then primary = d break end
+		end
+	end
+	if primary then sweepThrough(primary) end
+end
+
+-- Busca el “pedestal” (skull falsa de inicio) para romper el suelo e iniciar el chase
+local function findPedestalSkull()
+	-- Suele estar bajo UpliftStones / Pedastal o cerca del Pickup del pedestal.
+	local best, bestScore
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == "GoldenSkull" then
+			local score, p = 0, m.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("pedastal") or n:find("uplift") then score += 4 end
+				if n:find("ruinrush") or n:find("temple") then score += 2 end
+				p = p.Parent
+			end
+			if not best or score > bestScore then
+				best, bestScore = m, score
+			end
+		end
+	end
+	return best
+end
+
+-- Devuelve todas las GoldenSkull reales (las que suelen vivir en Folder "PickupEntities")
+local function findRealGoldenSkulls()
+	local list = {}
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == "GoldenSkull" then
+			local p = m.Parent
+			local isPickupEntity = false
+			while p do
+				if p:IsA("Folder") and p.Name == "PickupEntities" then
+					isPickupEntity = true
+					break
+				end
+				p = p.Parent
+			end
+			if isPickupEntity then table.insert(list, m) end
+		end
+	end
+	return list
+end
+
+local function setTempSafety()
+	-- Opcional: baja/elimina efectos molestos mientras nos movemos
+	if ForcedState then
+		ForcedState.set_buff("rr_auto_safe", { walk_speed = 22, jump_power = 0 })
+	end
+	-- Fija spawn seguro si existe
+	local sp = findSafeSpawn()
+	if sp and KillInterior then
+		pcall(function() KillInterior.set_spawn_point(sp) end)
+	end
+end
+
+local function clearTempSafety()
+	if ForcedState then
+		ForcedState.remove_buff("rr_auto_safe")
+	end
+end
+
+-- 1) activa pedestal si aún no empezó el chase (si existe)
+local function ensureChaseStarted(timeout)
+	timeout = timeout or 15
+	local t0 = os.clock()
+	local ped = findPedestalSkull()
+	if ped then
+		say("Pedestal localizado. Iniciando secuencia del suelo…")
+		touchModel(ped)
+		-- darle tiempo a la animación/caída/boulder
+		while os.clock() - t0 < timeout do
+			RunService.Heartbeat:Wait()
+		end
+	else
+		-- Puede que ya se haya iniciado o esté en una sala sin pedestal
+		say("No vi pedestal; continúo.")
+	end
+end
+
+-- 2) recoge todas las skulls reales disponibles ahora mismo
+local function collectAllSkulls(maxPasses, perPassWait)
+	maxPasses = maxPasses or 4
+	perPassWait = perPassWait or 2
+
+	local collectedAny = false
+	for pass=1,maxPasses do
+		local skulls = findRealGoldenSkulls()
+		if #skulls == 0 then
+			if pass == 1 then
+				-- quizá aún no cargaron; espera y reintenta
+				RunService.Heartbeat:Wait()
+			else
+				break
+			end
+		end
+
+		say(("Buscando Golden Skulls (ronda %d)… encontradas: %d"):format(pass, #skulls))
+		for _, s in ipairs(skulls) do
+			if s.Parent then
+				touchModel(s)
+				collectedAny = true
+				RunService.Heartbeat:Wait()
+			}
+		end
+		task.wait(perPassWait)
+	end
+	return collectedAny
+end
+
+-- 3) salir por la ExitDoor
+local function exitMinigame()
+	local door = findExitDoor()
+	if not door then
+		say("No encuentro ExitDoor ahora mismo. Reintenta con K cuando cargue.")
+		return false
+	end
+	say("Saliendo por ExitDoor…")
+	sweepThrough(door)
+	return true
+end
+
+-- Rutina completa
+local function runAuto()
+	setTempSafety()
+	-- pequeña espera para que el interior termine de montarse
+	task.wait(2.0)
+
+	-- Paso 1: iniciar la secuencia (si aplica)
+	ensureChaseStarted(6)
+
+	-- Paso 2: recolectar todas las skulls que existan
+	local got = collectAllSkulls(5, 1.2)
+	if got then
+		say("Skulls recogidas. Procediendo a la salida…")
+	else
+		say("No había Skulls para recoger (o ya estaban recogidas). Voy a la salida…")
+	end
+
+	-- Paso 3: salir
+	exitMinigame()
+
+	clearTempSafety()
+end
+
+-- Lanzado automático al cargar
+task.defer(function()
+	-- da un margen para que se enganchen los TouchEnded/Touched del cliente
+	task.wait(1)
+	runAuto()
+end)
+
+-- Atajos manuales (por si quieres controlar por pasos)
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.G then
+		setTempSafety()
+		if collectAllSkulls(5, 1.2) then
+			say("Recolección manual: listo.")
+		else
+			say("Recolección manual: no encontré Skulls.")
+		end
+		clearTempSafety()
+	elseif input.KeyCode == Enum.KeyCode.K then
+		setTempSafety()
+		if not exitMinigame() then
+			say("No pude salir; espera a que cargue la puerta y vuelve a pulsar K.")
+		end
+		clearTempSafety()
+	end
+end)
