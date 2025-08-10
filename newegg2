@@ -1,0 +1,517 @@
+--// LocalScript: ZeroHub – RuinRush Tools (con UI + Anti-AFK)
+--// Colocar en: StarterPlayerScripts
+
+------------------------------  SERVICIOS
+local RS              = game:GetService("ReplicatedStorage")
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local StarterGui      = game:GetService("StarterGui")
+local UserInputService= game:GetService("UserInputService")
+local VirtualUser     = game:GetService("VirtualUser")
+
+local LP = Players.LocalPlayer
+
+------------------------------  FSYS / ROACT (estilo Script 5)
+local Fsys = require(RS:WaitForChild("Fsys"))
+local Roact = Fsys.load("Roact")
+
+------------------------------  MÓDULOS OPCIONALES
+local function tryLoad(mod)
+	local ok, res = pcall(function() return Fsys.load(mod) end)
+	return ok and res or nil
+end
+local ForcedState   = tryLoad("MinigameForcedState")         -- set_buff/remove_buff (opcional)
+local KillInterior  = tryLoad("KillBlockInteriorManager")    -- set_spawn_point (opcional)
+local InteriorsM    = tryLoad("InteriorsM")                  -- TP entre interiores (opcional)
+
+------------------------------  UTIL MENSAJES
+local function say(msg)
+	print("[RuinRushAuto] " .. msg)
+	pcall(function()
+		StarterGui:SetCore("ChatMakeSystemMessage", { Text = "[RuinRushAuto] " .. msg })
+	end)
+end
+
+------------------------------  RUINRUSH: LÓGICA
+local RR = {}
+
+-- Helpers básicos
+local function getHRP()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	return ch:WaitForChild("HumanoidRootPart"), ch:WaitForChild("Humanoid")
+end
+
+local function findExitDoor()
+	local best, bestScore
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name == "ExitDoor" then
+			local score, p = 0, inst.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("ruinrush") or n:find("temple") or n:find("interior") then score += 3 end
+				if p:FindFirstChild("AttachmentPoints") then score += 2 end
+				if p:FindFirstChild("SpawnPoints") then score += 1 end
+				p = p.Parent
+			end
+			if not best or score > bestScore then
+				best, bestScore = inst, score
+			end
+		end
+	end
+	return best
+end
+
+local function findSafeSpawn()
+	for _, f in ipairs(workspace:GetDescendants()) do
+		if f:IsA("Folder") and f.Name == "SpawnPoints" and #f:GetChildren() > 0 then
+			local sp = f:FindFirstChild("1") or f:GetChildren()[1]
+			if sp and sp:IsA("BasePart") then return sp end
+		end
+	end
+	return nil
+end
+
+local function sweepThrough(part)
+	if not part or not part.Parent then return end
+	local hrp, hum = getHRP()
+	hum:ChangeState(Enum.HumanoidStateType.Running)
+	hrp.Anchored = false
+
+	local base = part.CFrame
+	local size = part.Size
+	local up = Vector3.new(0,1,0)
+	local startPos = base.Position + up*(size.Y*0.5) - base.LookVector*(size.Z + 4)
+	local endPos   = base.Position + up*(size.Y*0.5) + base.LookVector*(size.Z + 4)
+
+	for i = 0, 12 do
+		local t = i/12
+		local pos = startPos:Lerp(endPos, t)
+		hrp.CFrame = CFrame.new(pos, pos + base.LookVector)
+		RunService.Heartbeat:Wait()
+	end
+end
+
+local function touchModel(model)
+	if not model or not model.Parent then return end
+	local primary = model.PrimaryPart
+	if not primary then
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then primary = d; break end
+		end
+	end
+	if primary then sweepThrough(primary) end
+end
+
+local function findPedestalSkull()
+	local best, bestScore
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == "GoldenSkull" then
+			local score, p = 0, m.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("pedastal") or n:find("uplift") then score += 4 end
+				if n:find("ruinrush") or n:find("temple") then score += 2 end
+				p = p.Parent
+			end
+			if not best or score > bestScore then
+				best, bestScore = m, score
+			end
+		end
+	end
+	return best
+end
+
+local function findRealGoldenSkulls()
+	local list = {}
+	for _, m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name == "GoldenSkull" then
+			local p, isPickup = m.Parent, false
+			while p do
+				if p:IsA("Folder") and p.Name == "PickupEntities" then
+					isPickup = true; break
+				end
+				p = p.Parent
+			end
+			if isPickup then table.insert(list, m) end
+		end
+	end
+	return list
+end
+
+function RR.setTempSafety()
+	if ForcedState and type(ForcedState.set_buff) == "function" then
+		pcall(function() ForcedState.set_buff("rr_auto_safe", { walk_speed = 22, jump_power = 0 }) end)
+	end
+	local sp = findSafeSpawn()
+	if sp and KillInterior and type(KillInterior.set_spawn_point) == "function" then
+		pcall(function() KillInterior.set_spawn_point(sp) end)
+	end
+end
+
+function RR.clearTempSafety()
+	if ForcedState and type(ForcedState.remove_buff) == "function" then
+		pcall(function() ForcedState.remove_buff("rr_auto_safe") end)
+	end
+end
+
+function RR.ensureChaseStarted(timeout)
+	timeout = timeout or 15
+	local t0 = os.clock()
+	local ped = findPedestalSkull()
+	if ped then
+		say("Pedestal localizado. Iniciando secuencia del suelo…")
+		touchModel(ped)
+		while os.clock() - t0 < timeout do
+			RunService.Heartbeat:Wait()
+		end
+	else
+		say("No vi pedestal; continúo.")
+	end
+end
+
+function RR.collectAllSkulls(maxPasses, perPassWait)
+	maxPasses = maxPasses or 4
+	perPassWait = perPassWait or 2
+	local collectedAny = false
+
+	for pass = 1, maxPasses do
+		local skulls = findRealGoldenSkulls()
+		if #skulls == 0 then
+			if pass == 1 then RunService.Heartbeat:Wait() else break end
+		end
+
+		say(("Buscando Golden Skulls (ronda %d)… encontradas: %d"):format(pass, #skulls))
+		for _, s in ipairs(skulls) do
+			if s and s.Parent then
+				touchModel(s)
+				collectedAny = true
+				RunService.Heartbeat:Wait()
+			end
+		end
+		task.wait(perPassWait)
+	end
+	return collectedAny
+end
+
+function RR.exitMinigame()
+	local door = findExitDoor()
+	if not door then
+		say("No encuentro ExitDoor ahora mismo. Reintenta con K cuando cargue.")
+		return false
+	end
+	say("Saliendo por ExitDoor…")
+	sweepThrough(door)
+	return true
+end
+
+-- Auto Run (SIN TP automático)
+function RR.runAuto(onStep)
+	RR.setTempSafety()
+	task.wait(2.0)
+
+	if onStep then onStep("pedestal") end
+	RR.ensureChaseStarted(6)
+
+	if onStep then onStep("skulls") end
+	local got = RR.collectAllSkulls(5, 1.2)
+	if got then
+		say("Skulls recogidas. Procediendo a la salida…")
+	else
+		say("No había Skulls para recoger (o ya estaban recogidas). Voy a la salida…")
+	end
+
+	if onStep then onStep("exit") end
+	RR.exitMinigame()
+
+	RR.clearTempSafety()
+end
+
+------------------------------  TP AL INTERIOR (solo botón)
+local RR_DEST_ID = "AztecLobby"
+
+local function rr_get_current_dest()
+	if not InteriorsM then return nil end
+	local ok, loc = pcall(function() return InteriorsM.get_current_location() end)
+	return (ok and loc) and loc.destination_id or nil
+end
+
+function RR.teleportToInterior()
+	if not InteriorsM then
+		say("RuinRush: InteriorsM no disponible (aún).")
+		return false
+	end
+	if rr_get_current_dest() == RR_DEST_ID then
+		say("Ya estás en el interior de RuinRush.")
+		return true
+	end
+
+	-- Busca puerta por helper o por heurística (fallback)
+	local door
+	pcall(function() door = InteriorsM.get_door_to_location(RR_DEST_ID) end)
+	if not door then
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst:IsA("StringValue") and inst.Name == "destination_id" and inst.Value == RR_DEST_ID then
+				local config = inst.Parent
+				local working = config and config.Parent
+				door = working and working.Parent
+				break
+			end
+		end
+	end
+	if not door then
+		say("No hallé la puerta de '"..RR_DEST_ID.."'. Entra una vez y reintenta.")
+		return false
+	end
+
+	local ok, err = pcall(function()
+		InteriorsM.set_allow_non_character_teleports(true)
+		InteriorsM.enter_smooth(RR_DEST_ID, door, {
+			anchor_char_immediately = true,
+			fade_color = Color3.fromRGB(0,0,0),
+			fade_in_length = 0.25,
+			fade_out_length = 0.25,
+		})
+	end)
+	if not ok then
+		warn(err)
+		say("No pude TP al interior: "..tostring(err))
+		return false
+	end
+
+	say("TP a RuinRush Interior solicitado.")
+	return true
+end
+
+------------------------------  ATAJOS TECLADO (opcionales)
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.G then
+		RR.setTempSafety()
+		if RR.collectAllSkulls(5, 1.2) then
+			say("Recolección manual: listo.")
+		else
+			say("Recolección manual: no encontré Skulls.")
+		end
+		RR.clearTempSafety()
+	elseif input.KeyCode == Enum.KeyCode.K then
+		RR.setTempSafety()
+		if not RR.exitMinigame() then
+			say("No pude salir; espera a que cargue la puerta y vuelve a pulsar K.")
+		end
+		RR.clearTempSafety()
+	end
+end)
+
+------------------------------  UI (Roact) – Estilo Script 5 + Anti-AFK
+-- Destruir UI anterior si existe
+do
+	local pg = LP:WaitForChild("PlayerGui")
+	local prev = pg:FindFirstChild("ZeroHub")
+	if prev then prev:Destroy() end
+end
+
+-- Estado global Anti-AFK
+local antiAFKConn : RBXScriptConnection? = nil
+local function setAntiAFK(enabled:boolean)
+	if enabled then
+		if not antiAFKConn then
+			antiAFKConn = Players.LocalPlayer.Idled:Connect(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.zero)
+			end)
+		end
+	else
+		if antiAFKConn then
+			antiAFKConn:Disconnect()
+			antiAFKConn = nil
+		end
+	end
+end
+
+-- Componente RuinRush Panel (solo UI; llama a RR.*)
+local RuinRushPanel = Roact.Component:extend("RuinRushPanel")
+
+function RuinRushPanel:init()
+	self.state = {
+		status = "", running = false,
+	}
+end
+
+function RuinRushPanel:render()
+	local s = self.state
+	return Roact.createElement("Frame",{
+		BackgroundTransparency=1, AutomaticSize=Enum.AutomaticSize.Y, Size=UDim2.new(1,0,0,0),
+	},{
+		List = Roact.createElement("UIListLayout",{Padding=UDim.new(0,8)}),
+
+		Title = Roact.createElement("TextLabel",{
+			Text="RuinRush", Font=Enum.Font.GothamBold, TextSize=22,
+			BackgroundTransparency=1, TextColor3=Color3.new(1,1,1),
+			Size=UDim2.new(1,0,0,28),
+		}),
+
+		ButtonsRow = Roact.createElement("Frame",{
+			BackgroundTransparency=1, Size=UDim2.new(1,0,0,36),
+		},{
+			List = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6)}),
+
+			TPBtn = Roact.createElement("TextButton",{
+				Text="🌀 TP Interior", Font=Enum.Font.GothamBold, TextSize=16,
+				BackgroundColor3=Color3.fromRGB(70,70,130), TextColor3=Color3.new(1,1,1),
+				BorderSizePixel=0, Size=UDim2.new(0.25,-6,1,0),
+				[Roact.Event.Activated]=function()
+					RR.teleportToInterior()
+				end,
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+
+			AutoBtn = Roact.createElement("TextButton",{
+				Text=s.running and "⏳ Ejecutando…" or "▶ Auto Run",
+				Font=Enum.Font.GothamBold, TextSize=16,
+				BackgroundColor3=Color3.fromRGB(80,150,90), TextColor3=Color3.new(1,1,1),
+				BorderSizePixel=0, Size=UDim2.new(0.25,-6,1,0),
+				[Roact.Event.Activated]=function()
+					if s.running then return end
+					self:setState({running=true,status="Iniciando…" })
+					task.spawn(function()
+						RR.runAuto(function(step)
+							local map = {tp="TP…", pedestal="Pedestal…", skulls="Recolectando…", exit="Saliendo…"}
+							self:setState({status = map[step] or ""})
+						end)
+						self:setState({running=false,status="Listo"})
+					end)
+				end,
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+
+			CollectBtn = Roact.createElement("TextButton",{
+				Text="🖐 Recolectar", Font=Enum.Font.GothamBold, TextSize=16,
+				BackgroundColor3=Color3.fromRGB(60,120,60), TextColor3=Color3.new(1,1,1),
+				BorderSizePixel=0, Size=UDim2.new(0.25,-6,1,0),
+				[Roact.Event.Activated]=function()
+					RR.setTempSafety()
+					if RR.collectAllSkulls(5,1.2) then say("Recolección: listo.") else say("Recolección: nada.") end
+					RR.clearTempSafety()
+				end,
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+
+			ExitBtn = Roact.createElement("TextButton",{
+				Text="🚪 Salir", Font=Enum.Font.GothamBold, TextSize=16,
+				BackgroundColor3=Color3.fromRGB(180,60,60), TextColor3=Color3.new(1,1,1),
+				BorderSizePixel=0, Size=UDim2.new(0.25,-6,1,0),
+				[Roact.Event.Activated]=function()
+					RR.setTempSafety()
+					if not RR.exitMinigame() then say("Espera a que cargue la puerta y reintenta.") end
+					RR.clearTempSafety()
+				end,
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+		}),
+
+		Status = Roact.createElement("TextLabel",{
+			Text=s.status, Font=Enum.Font.Gotham, TextSize=15,
+			BackgroundTransparency=1, TextColor3=Color3.fromRGB(200,200,200),
+			Size=UDim2.new(1,0,0,18),
+		}),
+	})
+end
+
+-- Root (ventana, anti-AFK, toggle UI)
+local Root = Roact.Component:extend("ZeroHubRoot")
+function Root:init()
+	self.state = {
+		showUI = true,
+		pos = UDim2.new(0.5,-309,0.5,-200), -- ~618×420
+		dragging=false, dragOffset=Vector2.zero,
+		antiAFK=false,
+	}
+end
+
+function Root:toggleUI() self:setState({showUI = not self.state.showUI}) end
+function Root:startDrag(io) self:setState({dragging=true, dragOffset=(io.Position - self.ref.AbsolutePosition)}) end
+function Root:doDrag(io) if self.state.dragging then self:setState({pos=UDim2.new(0, (io.Position - self.state.dragOffset).X, 0, (io.Position - self.state.dragOffset).Y)}) end end
+function Root:stopDrag() self:setState({dragging=false}) end
+function Root:toggleAFK()
+	local newv = not self.state.antiAFK
+	setAntiAFK(newv)
+	self:setState({antiAFK=newv})
+end
+
+function Root:render()
+	local s = self.state
+	local ToggleBtn = Roact.createElement("TextButton",{
+		Text=":D", Font=Enum.Font.GothamBold, TextSize=22,
+		BackgroundColor3=Color3.fromRGB(50,50,90), TextColor3=Color3.new(1,1,1),
+		Size=UDim2.new(0,36,0,36), Position=UDim2.new(0,10,0,10), ZIndex=5,
+		[Roact.Event.Activated]=function() self:toggleUI() end,
+	})
+
+	local Main = Roact.createElement("Frame",{
+		Visible=s.showUI, Size=UDim2.new(0,618,0,420), Position=s.pos,
+		BackgroundColor3=Color3.fromRGB(30,30,30), BorderSizePixel=0,
+		[Roact.Ref]=function(r) self.ref=r end,
+		[Roact.Event.InputBegan]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:startDrag(io) end end,
+		[Roact.Event.InputChanged]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseMovement then self:doDrag(io) end end,
+		[Roact.Event.InputEnded]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:stopDrag() end end,
+	},{
+		UICorner = Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+
+		Header = Roact.createElement("Frame",{
+			BackgroundTransparency=1, Size=UDim2.new(1,0,0,46),
+		},{
+			Title = Roact.createElement("TextLabel",{
+				Text="ZeroHub • Minijuegos", Font=Enum.Font.GothamBold, TextSize=18,
+				BackgroundTransparency=1, TextColor3=Color3.new(1,1,1),
+				Size=UDim2.new(0.7,0,1,0), Position=UDim2.new(0,12,0,0),
+				TextXAlignment = Enum.TextXAlignment.Left,
+			}),
+			AntiAFK = Roact.createElement("TextButton",{
+				Text = s.antiAFK and "🟢 Anti-AFK ON" or "⚪ Anti-AFK",
+				Font=Enum.Font.GothamBold, TextSize=16,
+				BackgroundColor3 = s.antiAFK and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),
+				TextColor3=Color3.new(1,1,1), BorderSizePixel=0,
+				Size=UDim2.new(0.28,-20,1,-8), Position=UDim2.new(0.72,10,0,8),
+				[Roact.Event.Activated]=function() self:toggleAFK() end,
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})})
+		}),
+
+		Sep = Roact.createElement("Frame",{
+			BackgroundColor3=Color3.fromRGB(55,55,55), BorderSizePixel=0,
+			Size=UDim2.new(1,-20,0,1), Position=UDim2.new(0,10,0,46),
+		}),
+
+		Scroll = Roact.createElement("ScrollingFrame",{
+			AutomaticCanvasSize=Enum.AutomaticSize.Y, CanvasSize=UDim2.new(),
+			BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=6,
+			Size=UDim2.new(1,0,1,-56), Position=UDim2.new(0,0,0,54),
+		},{
+			Wrapper = Roact.createElement("Frame",{
+				BackgroundTransparency=1, AutomaticSize=Enum.AutomaticSize.Y,
+				Size=UDim2.new(0,420,0,0), AnchorPoint=Vector2.new(0.5,0),
+				Position=UDim2.new(0.5,0,0,10),
+			},{
+				List = Roact.createElement("UIListLayout",{Padding=UDim.new(0,12)}),
+
+				RuinRush = Roact.createElement(RuinRushPanel,{}),
+
+				Footer = Roact.createElement("TextLabel",{
+					Text="ZeroHub • Created by 0Systems - hehehe",
+					Font=Enum.Font.Gotham, TextSize=13,
+					BackgroundTransparency=1, TextColor3=Color3.fromRGB(150,150,150),
+					Size=UDim2.new(1,0,0,18), LayoutOrder=99, TextXAlignment=Enum.TextXAlignment.Center,
+				}),
+			}),
+		}),
+	})
+
+	return Roact.createElement("ScreenGui",{
+		Name="ZeroHub", ResetOnSpawn=false,
+	}, { Toggle=ToggleBtn, Main=Main })
+end
+
+-- Montar UI (después de limpiar duplicados)
+local app = Roact.createElement(Root)
+Roact.mount(app, LP:WaitForChild("PlayerGui"))
+
+------------------------------  AUTO ARRANQUE (opcional: no TP)
+task.defer(function()
+	task.wait(1)
+	RR.runAuto()
+end)
