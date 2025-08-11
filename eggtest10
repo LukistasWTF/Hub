@@ -1,0 +1,625 @@
+-- Minigames Hub (RuinRush 1.0 + Teleports con retorno por la misma MainDoor) · LocalScript
+-- ⭐ Colocar en StarterPlayerScripts (CLIENTE). No funciona en Script de servidor.
+
+--== Config
+local AZTEC_ROOT_NAME = "MainMap!Aztec" -- workspace/Interiors/<esto>/Doors/*
+
+--== Guardia: asegurar que es cliente
+if not game:GetService("Players").LocalPlayer then
+	warn("[Hub] Este archivo debe ser un LocalScript en StarterPlayerScripts.")
+	return
+end
+
+--== Servicios
+local Players, RS, RunService, StarterGui, UIS, VU, TweenService =
+	game:GetService("Players"), game:GetService("ReplicatedStorage"),
+	game:GetService("RunService"), game:GetService("StarterGui"),
+	game:GetService("UserInputService"), game:GetService("VirtualUser"),
+	game:GetService("TweenService")
+
+local LP = Players.LocalPlayer
+
+--== Mensajes
+local function say(msg)
+	print("[Hub] "..msg)
+	pcall(function() StarterGui:SetCore("ChatMakeSystemMessage",{Text="[Hub] "..msg}) end)
+end
+
+--== Fsys / Roact / DoorsM (si no están, el Hub visual se omite y la lógica sigue)
+local Fsys do
+	local ok,res = pcall(function() return require(RS:WaitForChild("Fsys")) end)
+	if ok then Fsys = res end
+end
+local Roact = nil
+if Fsys then
+	local ok = pcall(function() return Fsys.load("Roact") end)
+	if ok then Roact = Fsys.load("Roact") end
+end
+local DoorsM = nil
+if Fsys then
+	local ok = pcall(function() return Fsys.load("DoorsM") end)
+	if ok then DoorsM = Fsys.load("DoorsM") end
+end
+
+--== Helpers
+local function getHRP()
+	local ch = LP.Character or LP.CharacterAdded:Wait()
+	return ch:WaitForChild("HumanoidRootPart"), ch:WaitForChild("Humanoid")
+end
+local function formatClock(sec) sec=math.max(0,math.floor(sec)); return ("%02d:%02d"):format(math.floor(sec/60),sec%60) end
+
+-- Fade blanco rápido para el “enter/exit”
+local function fadeWhite(duration, from, to, yields)
+	local pg = LP:WaitForChild("PlayerGui")
+	local sg = Instance.new("ScreenGui"); sg.ResetOnSpawn=false; sg.IgnoreGuiInset=true; sg.DisplayOrder=1e6
+	sg.Name="RR_Fade"; sg.Parent=pg
+	local f = Instance.new("Frame"); f.BackgroundColor3=Color3.new(1,1,1); f.BorderSizePixel=0
+	f.Size=UDim2.fromScale(1,1); f.BackgroundTransparency=from or 1; f.Parent=sg
+	local tw = TweenService:Create(f, TweenInfo.new(duration or 0.45), {BackgroundTransparency=to or 0})
+	tw:Play(); if yields then tw.Completed:Wait() end
+	task.delay(0.5, function() if sg.Parent then sg:Destroy() end end)
+end
+
+-- =============================================================================
+--                      Puertas (buscar y cruzar TouchToEnter)
+-- =============================================================================
+
+-- Carpeta Doors del Aztec root
+local function getAztecDoorsFolder()
+	local interiors = workspace:FindFirstChild("Interiors")
+	if not interiors then return end
+	local root = interiors:FindFirstChild(AZTEC_ROOT_NAME)
+	return root and root:FindFirstChild("Doors") or nil
+end
+
+-- Buscar un descendiente por ruta "A/B/C"
+local function findByPath(root, path)
+	if not (root and path) then return end
+	local node = root
+	for seg in string.gmatch(path, "[^/]+") do
+		node = node and node:FindFirstChild(seg)
+	end
+	return node
+end
+
+-- Adivinar la MainDoor más cercana (si el jugador entró sin el Hub)
+local function guessCurrentMainDoor()
+	local interiors = workspace:FindFirstChild("Interiors"); if not interiors then return end
+	local hrp = (LP.Character or LP.CharacterAdded:Wait()):FindFirstChild("HumanoidRootPart"); if not hrp then return end
+	local best, bestDist
+	for _,container in ipairs(interiors:GetChildren()) do
+		local doors = container:FindFirstChild("Doors")
+		local main = doors and doors:FindFirstChild("MainDoor")
+		local touch = main and main:FindFirstChild("WorkingParts") and main.WorkingParts:FindFirstChild("TouchToEnter")
+		if touch and touch:IsA("BasePart") then
+			local d = (touch.Position - hrp.Position).Magnitude
+			if not best or d < bestDist then best, bestDist = main, d end
+		end
+	end
+	return best
+end
+
+-- Si DoorsM está disponible, registramos la puerta para que el sistema nativo responda a .Touched
+local function ensureDoorWired(doorModel)
+	if DoorsM and doorModel then
+		pcall(function() DoorsM.get_door(doorModel) end)
+	end
+end
+
+-- Caminar a través del TouchToEnter.
+-- faceInside=true => de fuera hacia dentro; false => de dentro hacia fuera
+local function walkThroughTouch(touch, faceInside)
+	local hrp,hum = getHRP()
+
+	-- salir de asiento si hace falta
+	if hum.Sit then
+		hum.Sit=false; hum.Jump=true
+		local weld = hum.SeatPart and hum.SeatPart:FindFirstChild("SeatWeld")
+		if weld then weld:Destroy() end
+		task.wait(0.2)
+	end
+
+	-- stream seguro
+	pcall(function() LP:RequestStreamAroundAsync(touch.Position, 2) end)
+
+	local base = touch.CFrame
+	local up   = Vector3.new(0, 1.6, 0)
+	local outside = base.Position + base.LookVector * (touch.Size.Z/2 + 6) + up
+	local inside  = base.Position - base.LookVector * (touch.Size.Z/2 + 2) + up
+
+	local startPos = faceInside and outside or inside
+	local endPos   = faceInside and inside  or outside
+	local lookDir  = faceInside and (-base.LookVector) or (base.LookVector)
+
+	hrp.Anchored=false
+	hrp.CFrame = CFrame.new(startPos, startPos + lookDir)
+
+	-- empuje suave mientras cruza (ayuda a disparar .Touched)
+	local hbConn = RunService.Heartbeat:Connect(function()
+		if hum and hum.Parent then hum:Move(lookDir) end
+	end)
+
+	for i=0,14 do
+		local pos = startPos:Lerp(endPos, i/14)
+		hrp.CFrame = CFrame.new(pos, pos + lookDir)
+		RunService.Heartbeat:Wait()
+	end
+
+	if hbConn then hbConn:Disconnect() end
+end
+
+-- Tres pasitos hacia atrás antes de entrar (cosmético/petición)
+local function stepBackwards(times, stepStuds, perStepWait)
+	times = times or 3; stepStuds = stepStuds or 1.25; perStepWait = perStepWait or 0.08
+	local hrp = getHRP()
+	for _=1,times do
+		hrp.CFrame = hrp.CFrame * CFrame.new(0,0, stepStuds) -- atrás respecto a tu look
+		RunService.Heartbeat:Wait()
+		task.wait(perStepWait)
+	end
+end
+
+-- =============================================================================
+--                     Gestor de Teleports (retorno + entrada)
+-- =============================================================================
+local Tele = {
+	lastEnteredDoor = nil, -- Model de la última puerta usada para ENTRAR (se usa para salir)
+	busy = false,
+	delayAfterExit = 5, -- segundos entre salir y nuevo salto
+}
+
+local function prettyLabel(s) local i=string.find(s,"/"); return i and string.sub(s,1,i-1) or s end
+
+-- Cambiar a otra puerta:
+-- 1) si hay interior activo y sabemos la puerta, salimos por esa MainDoor (a Aztec)
+-- 2) esperamos 5s
+-- 3) entramos al destino cruzando su Touch
+function Tele.gotoDoorWithReturn(doorKey)
+	if Tele.busy then say("[TP] Ocupado, espera…"); return end
+	Tele.busy = true
+
+	task.spawn(function()
+		-- 1) Salir por la MISMA puerta si procede
+		local mustExit = Tele.lastEnteredDoor ~= nil
+		if not Tele.lastEnteredDoor then
+			local guessed = guessCurrentMainDoor()
+			if guessed then Tele.lastEnteredDoor = guessed; mustExit = true end
+		end
+
+		if mustExit and Tele.lastEnteredDoor and Tele.lastEnteredDoor.Parent then
+			local touchOut = Tele.lastEnteredDoor:FindFirstChild("WorkingParts")
+			touchOut = touchOut and touchOut:FindFirstChild("TouchToEnter")
+			if touchOut and touchOut:IsA("BasePart") then
+				ensureDoorWired(Tele.lastEnteredDoor)
+				say("[TP] Saliendo por la misma MainDoor → "..(Tele.lastEnteredDoor.Name or "?"))
+				fadeWhite(0.18,1,0,true)
+				walkThroughTouch(touchOut, false) -- salir
+				task.wait(0.05)
+				fadeWhite(0.26,0,1,false)
+			else
+				say("[TP] No pude usar la puerta de salida (Touch faltante). Intentaré continuar.")
+			end
+		end
+
+		-- 2) Espera
+		task.wait(Tele.delayAfterExit)
+
+		-- 3) Entrar al destino en MainMap!Aztec
+		local doors = getAztecDoorsFolder()
+		if not doors then
+			say("[TP] No encuentro Interiors/"..AZTEC_ROOT_NAME.."/Doors"); Tele.busy=false; return
+		end
+
+		local target = findByPath(doors, doorKey) or doors:FindFirstChild(doorKey)
+		if not (target and target:IsA("Model")) then
+			say("[TP] Door '"..doorKey.."' no existe en Doors"); Tele.busy=false; return
+		end
+		local touchIn = target:FindFirstChild("WorkingParts")
+		touchIn = touchIn and touchIn:FindFirstChild("TouchToEnter")
+		if not (touchIn and touchIn:IsA("BasePart")) then
+			say("[TP] '"..doorKey.."' sin TouchToEnter."); Tele.busy=false; return
+		end
+
+		ensureDoorWired(target)
+
+		-- Pasitos hacia atrás antes de entrar
+		stepBackwards(3, 1.25, 0.08)
+
+		fadeWhite(0.18,1,0,true)
+		walkThroughTouch(touchIn, true) -- entrar
+		task.wait(0.05)
+		fadeWhite(0.26,0,1,false)
+
+		-- Guardar para el próximo cambio
+		Tele.lastEnteredDoor = target
+		say("[TP] Dentro → "..prettyLabel(doorKey))
+
+		Tele.busy = false
+	end)
+end
+
+-- Opciones del desplegable
+local TELEPORT_OPTIONS = {
+	"AFKZone/MainDoor",
+	"AutoShop/MainDoor",
+	"AztecLobbyEntrance",
+	"AztecPortalExit",
+	"BabyShop/MainDoor",
+	"BeachShop/MainDoor",
+	"CampingShop/MainDoor",
+	"Cave/MainDoor",
+	"CoffeeShop/MainDoor",
+	"DebugInterior/MainDoor",
+	"HatShop/MainDoor",
+	"Hospital/MainDoor",
+	"IceCream/MainDoor",
+	"Neighborhood/MainDoor",
+	"Nursery/MainDoor",
+	"Obbies/MainDoor",
+	"PetShop/MainDoor",
+	"PizzaShop/MainDoor",
+	"SafetyHub/MainDoor",
+	"Salon/MainDoor",
+	"School/MainDoor",
+	"SkyCastle/MainDoor",
+	"SkyCastle/MainDoor2",
+	"Supermarket/MainDoor",
+	"ToyShop/MainDoor",
+	"WarpDoor",
+}
+
+-- =============================================================================
+--                       RUINRUSH 1.0 (intacto)
+-- =============================================================================
+local ForcedState = nil
+local KillInterior = nil
+if Fsys then
+	local ok = pcall(function() return Fsys.load("MinigameForcedState") end)
+	if ok then ForcedState = Fsys.load("MinigameForcedState") end
+	ok = pcall(function() return Fsys.load("KillBlockInteriorManager") end)
+	if ok then KillInterior = Fsys.load("KillBlockInteriorManager") end
+end
+
+local RR = {}
+
+function RR.findExitDoor()
+	local best,scoreBest
+	for _,inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and inst.Name=="ExitDoor" then
+			local s, p = 0, inst.Parent
+			while p do
+				local n = string.lower(p.Name)
+				if n:find("ruinrush") or n:find("temple") or n:find("interior") then s+=3 end
+				if p:FindFirstChild("AttachmentPoints") then s+=2 end
+				if p:FindFirstChild("SpawnPoints") then s+=1 end
+				p = p.Parent
+			end
+			if not best or s>scoreBest then best,scoreBest = inst,s end
+		end
+	end
+	return best
+end
+
+function RR.findSafeSpawn()
+	for _,f in ipairs(workspace:GetDescendants()) do
+		if f:IsA("Folder") and f.Name=="SpawnPoints" and #f:GetChildren()>0 then
+			local sp = f:FindFirstChild("1") or f:GetChildren()[1]
+			if sp and sp:IsA("BasePart") then return sp end
+		end
+	end
+end
+
+function RR.sweepThrough(part)
+	if not part or not part.Parent then return end
+	local hrp,hum = getHRP(); hum:ChangeState(Enum.HumanoidStateType.Running); hrp.Anchored=false
+	local base,size,up = part.CFrame, part.Size, Vector3.new(0,1,0)
+	local a = base.Position + up*(size.Y*0.5) - base.LookVector*(size.Z+4)
+	local b = base.Position + up*(size.Y*0.5) + base.LookVector*(size.Z+4)
+	for i=0,12 do
+		local pos = a:Lerp(b, i/12)
+		hrp.CFrame = CFrame.new(pos, pos + base.LookVector)
+		RunService.Heartbeat:Wait()
+	end
+end
+
+function RR.touchModel(model)
+	if not model or not model.Parent then return end
+	local primary = model.PrimaryPart
+	if not primary then
+		for _,d in ipairs(model:GetDescendants()) do if d:IsA("BasePart") then primary=d; break end end
+	end
+	if primary then RR.sweepThrough(primary) end
+end
+
+function RR.findPedestalSkull()
+	local best,bscore
+	for _,m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name=="GoldenSkull" then
+			local s,p = 0,m.Parent
+			while p do
+				local n=string.lower(p.Name)
+				if n:find("pedastal") or n:find("uplift") then s+=4 end
+				if n:find("ruinrush") or n:find("temple") then s+=2 end
+				p=p.Parent
+			end
+			if not best or s>bscore then best,bscore=m,s end
+		end
+	end
+	return best
+end
+
+function RR.findRealSkulls()
+	local list={}
+	for _,m in ipairs(workspace:GetDescendants()) do
+		if m:IsA("Model") and m.Name=="GoldenSkull" then
+			local p=m.Parent; local ok=false
+			while p do
+				if p:IsA("Folder") and p.Name=="PickupEntities" then ok=true; break end
+				p=p.Parent
+			end
+			if ok then table.insert(list,m) end
+		end
+	end
+	return list
+end
+
+function RR.safeOn()
+	if ForcedState and type(ForcedState.set_buff)=="function" then pcall(function() ForcedState.set_buff("rr_safe",{walk_speed=22,jump_power=0}) end) end
+	local sp = RR.findSafeSpawn()
+	if sp and KillInterior and type(KillInterior.set_spawn_point)=="function" then pcall(function() KillInterior.set_spawn_point(sp) end) end
+end
+function RR.safeOff()
+	if ForcedState and type(ForcedState.remove_buff)=="function" then pcall(function() ForcedState.remove_buff("rr_safe") end) end
+end
+
+function RR.ensureChaseStarted(timeout)
+	timeout = timeout or 15
+	local t0 = os.clock()
+	local ped = RR.findPedestalSkull()
+	if ped then
+		say("RuinRush: activando pedestal…")
+		RR.touchModel(ped)
+		while os.clock()-t0 < timeout do RunService.Heartbeat:Wait() end
+	end
+end
+
+function RR.collectAll(maxPasses, perPassWait, progressCb)
+	maxPasses, perPassWait = maxPasses or 4, perPassWait or 1.2
+	local collected = 0
+	for pass=1,maxPasses do
+		local skulls = RR.findRealSkulls()
+		if progressCb then progressCb(("Ronda %d: %d skulls"):format(pass,#skulls)) end
+		if #skulls==0 then if pass==1 then RunService.Heartbeat:Wait() else break end end
+		for _,s in ipairs(skulls) do
+			if s and s.Parent then
+				RR.touchModel(s); collected+=1
+				RunService.Heartbeat:Wait()
+				if progressCb then progressCb(nil,collected) end
+			end
+		end
+		task.wait(perPassWait)
+	end
+	return collected
+end
+
+function RR.exit()
+	local door = RR.findExitDoor()
+	if not door then say("RuinRush: no veo ExitDoor aún."); return false end
+	RR.sweepThrough(door); return true
+end
+
+function RR.runAuto(onStep,onProgress)
+	RR.safeOn(); task.wait(2)
+	if onStep then onStep("start") end
+	RR.ensureChaseStarted(6)
+	if onStep then onStep("collect") end
+	local got = RR.collectAll(5,1.2,onProgress)
+	if got>0 then say(("RuinRush: %d skulls recogidas."):format(got)) end
+	if onStep then onStep("exit") end
+	RR.exit(); RR.safeOff(); if onStep then onStep("done") end
+end
+
+UIS.InputBegan:Connect(function(input,gp)
+	if gp then return end
+	if input.KeyCode==Enum.KeyCode.G then RR.safeOn(); local n=RR.collectAll(5,1.2); RR.safeOff(); say("RuinRush G: "..(n or 0).." skulls") end
+	if input.KeyCode==Enum.KeyCode.K then RR.safeOn(); RR.exit(); RR.safeOff() end
+end)
+
+-- =============================================================================
+--                                   UI (Roact)
+-- =============================================================================
+if not Roact then
+	say("Falta Roact: el Hub visual no se monta (la lógica de TP/RR funciona).")
+	return
+end
+
+-- Panel Teleports
+local TeleportsPanel = Roact.Component:extend("TeleportsPanel")
+function TeleportsPanel:init()
+	self.state = { open=false, selectedIndex=1, status="Listo" }
+end
+function TeleportsPanel:setOpen(o) self:setState({open=o}) end
+function TeleportsPanel:select(i) self:setState({selectedIndex=i, open=false}) end
+function TeleportsPanel:enterNow()
+	local key = TELEPORT_OPTIONS[self.state.selectedIndex]
+	self:setState({status="Cambiando…"})
+	task.spawn(function()
+		Tele.gotoDoorWithReturn(key)
+		task.wait(0.1)
+		self:setState({status="Listo"})
+	end)
+end
+function TeleportsPanel:render()
+	local s = self.state
+	local hDrop = s.open and math.min(#TELEPORT_OPTIONS*28, 180) or 0
+	local selectedText = prettyLabel(TELEPORT_OPTIONS[s.selectedIndex] or "?")
+
+	local dropChildren = { Layout=Roact.createElement("UIListLayout",{Padding=UDim.new(0,2)}) }
+	for i,opt in ipairs(TELEPORT_OPTIONS) do
+		dropChildren["opt_"..i] = Roact.createElement("TextButton",{
+			Text=prettyLabel(opt), Font=Enum.Font.Gotham, TextSize=16,
+			BackgroundColor3 = (i==s.selectedIndex) and Color3.fromRGB(70,120,200) or Color3.fromRGB(55,55,55),
+			TextColor3=Color3.new(1,1,1), BorderSizePixel=0, Size=UDim2.new(1,-6,0,26),
+			[Roact.Event.Activated]=function() self:select(i) end
+		},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})})
+	end
+
+	return Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0)},{
+		List = Roact.createElement("UIListLayout",{Padding=UDim.new(0,10)}),
+		Title = Roact.createElement("TextLabel",{Text="Teleports (vuelve por la misma MainDoor)",Font=Enum.Font.GothamBold,TextSize=20,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,24)}),
+
+		Row = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,40)},{
+			H = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8)}),
+			Field = Roact.createElement("TextButton",{
+				Text="Destino: "..selectedText, Font=Enum.Font.GothamBold, TextSize=18,
+				BackgroundColor3=Color3.fromRGB(55,55,55), TextColor3=Color3.new(1,1,1), BorderSizePixel=0,
+				Size=UDim2.new(1,-160,1,0),
+				[Roact.Event.Activated]=function() self:setOpen(not s.open) end
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			Go = Roact.createElement("TextButton",{
+				Text="🌀 Cambiar", Font=Enum.Font.GothamBold, TextSize=18,
+				BackgroundColor3=Color3.fromRGB(120,90,200), TextColor3=Color3.new(1,1,1), BorderSizePixel=0,
+				Size=UDim2.new(0,150,1,0),
+				[Roact.Event.Activated]=function() self:enterNow() end
+			},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+		}),
+
+		Drop = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(40,40,40),BorderSizePixel=0,ClipsDescendants=true,Size=UDim2.new(1,0,0,hDrop)},{
+			UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),
+			List=Roact.createElement("ScrollingFrame",{BackgroundTransparency=1,BorderSizePixel=0,CanvasSize=UDim2.new(0,0,0,#TELEPORT_OPTIONS*28),ScrollBarThickness=6,Size=UDim2.new(1,0,1,0)}, dropChildren)
+		}),
+
+		Status = Roact.createElement("TextLabel",{Text=("Estado: %s"):format(s.status),Font=Enum.Font.Gotham,TextSize=16,BackgroundTransparency=1,TextColor3=Color3.fromRGB(220,220,220),Size=UDim2.new(1,0,0,18)}),
+	})
+end
+
+-- Panel RuinRush (igual que 1.0)
+local RRPanel = Roact.Component:extend("RRPanel")
+function RRPanel:init()
+	self.state = { running=false, step="idle", status="Listo", progress=0, collected=0, timer=0, log={} }
+	self.timer = RunService.Heartbeat:Connect(function(dt) if self.state.running then self:setState({timer=self.state.timer+dt}) end end)
+end
+function RRPanel:willUnmount() if self.timer then self.timer:Disconnect() end end
+function RRPanel:pushLog(t) local copy=table.clone(self.state.log); table.insert(copy,1,t); if #copy>7 then copy[#copy]=nil end; self:setState({log=copy}) end
+function RRPanel:run()
+	if self.state.running then return end
+	self:setState({running=true, step="start", status="Iniciando…", timer=0, collected=0, progress=0}); self:pushLog("▶ Auto Run")
+	task.spawn(function()
+		local function onStep(st)
+			if     st=="start"   then self:setState({step="start",   status="Activando pedestal…"}); self:pushLog("Pedestal…")
+			elseif st=="collect" then self:setState({step="collect", status="Recogiendo skulls…"}); self:pushLog("Skulls…")
+			elseif st=="exit"    then self:setState({step="exit",    status="Saliendo…"});         self:pushLog("Salida…")
+			elseif st=="done"    then self:setState({step="done",    status="Hecho!"});            self:pushLog("✔ Terminado")
+			end
+		end
+		local function onProg(_,c) if c then self:setState({collected=c, progress=math.clamp(c/3,0,1)}) end end
+		RR.runAuto(onStep,onProg)
+		self:setState({running=false, status="Listo"})
+	end)
+end
+function RRPanel:collectOnly()
+	if self.state.running then return end
+	self:setState({running=true, step="collect", status="Recogiendo…", timer=0, collected=0, progress=0}); self:pushLog("▶ Solo Skulls")
+	task.spawn(function()
+		RR.safeOn()
+		local n = RR.collectAll(5,1.2,function(_,c) if c then self:setState({collected=c,progress=math.clamp(c/3,0,1)}) end end)
+		RR.safeOff()
+		self:pushLog("Skulls: "..tostring(n)); self:setState({running=false, status="Listo"})
+	end)
+end
+function RRPanel:exitOnly()
+	if self.state.running then return end
+	self:setState({running=true, step="exit", status="Saliendo…", timer=0}); self:pushLog("▶ Salir")
+	task.spawn(function() RR.safeOn(); RR.exit(); RR.safeOff(); self:setState({running=false, status="Listo"}) end)
+end
+function RRPanel:render()
+	local s=self.state
+	return Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0)},{
+		UIList = Roact.createElement("UIListLayout",{Padding=UDim.new(0,10)}),
+
+		Title = Roact.createElement("TextLabel",{Text="Temple Trek • RuinRush",Font=Enum.Font.GothamBold,TextSize=20,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,0,0,24)}),
+
+		Btns = Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,40)},{
+			H = Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8)}),
+			B1 = Roact.createElement("TextButton",{Text=s.running and ("Ejecutando… "..formatClock(s.timer)) or "▶ Auto Run",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=s.running and Color3.fromRGB(80,80,120) or Color3.fromRGB(70,120,200),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.34,-5,1,0),[Roact.Event.Activated]=function() self:run() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			B2 = Roact.createElement("TextButton",{Text="💎 Solo Skulls (G)",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=Color3.fromRGB(80,150,90),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.33,-5,1,0),[Roact.Event.Activated]=function() self:collectOnly() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			B3 = Roact.createElement("TextButton",{Text="🚪 Salir (K)",Font=Enum.Font.GothamBold,TextSize=18,BackgroundColor3=Color3.fromRGB(180,60,60),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0.33,0,1,0),[Roact.Event.Activated]=function() self:exitOnly() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+		}),
+
+		ProgBG = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(50,50,50),BorderSizePixel=0,Size=UDim2.new(1,0,0,14)},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)}),Fill=Roact.createElement("Frame",{Size=UDim2.new(s.progress,0,1,0),BackgroundColor3=Color3.fromRGB(80,200,100),BorderSizePixel=0},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,4)})})}),
+		Status = Roact.createElement("TextLabel",{Text=("Estado: %s"):format(s.status),Font=Enum.Font.Gotham,TextSize=16,BackgroundTransparency=1,TextColor3=Color3.fromRGB(220,220,220),Size=UDim2.new(1,0,0,18)}),
+
+		LogBox = Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(40,40,40),BorderSizePixel=0,Size=UDim2.new(1,0,1,-96)},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)}),Pad=Roact.createElement("UIPadding",{PaddingTop=UDim.new(0,8),PaddingLeft=UDim.new(0,8)}),List=Roact.createElement("UIListLayout",{Padding=UDim.new(0,6)}),
+			L1=Roact.createElement("TextLabel",{Text=s.log[1] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(1,-16,0,18)}),
+			L2=Roact.createElement("TextLabel",{Text=s.log[2] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(200,200,200),Size=UDim2.new(1,-16,0,18)}),
+			L3=Roact.createElement("TextLabel",{Text=s.log[3] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(180,180,180),Size=UDim2.new(1,-16,0,18)}),
+			L4=Roact.createElement("TextLabel",{Text=s.log[4] or "",Font=Enum.Font.Gotham,TextSize=15,BackgroundTransparency=1,TextColor3=Color3.fromRGB(160,160,160),Size=UDim2.new(1,-16,0,18)}),
+		})
+	})
+end
+
+-- HUB raíz
+local Hub = Roact.Component:extend("MinigamesHub")
+function Hub:init()
+	self.state = { showUI=true, pos=UDim2.new(0.5,-380,0.55,-200), dragging=false, dragOffset=Vector2.zero, antiAFK=false, active="RuinRush" }
+end
+function Hub:willUnmount() if self.afkConn then self.afkConn:Disconnect() end end
+function Hub:startDrag(io) self:setState({dragging=true,dragOffset=(io.Position-Vector3.new(self.ref.AbsolutePosition.X,self.ref.AbsolutePosition.Y,0)).XY}) end
+function Hub:doDrag(io) if self.state.dragging then local np=(io.Position-Vector3.new(0,0,0)).XY-self.state.dragOffset; self:setState({pos=UDim2.new(0,np.X,0,np.Y)}) end end
+function Hub:stopDrag() self:setState({dragging=false}) end
+function Hub:toggleAntiAFK()
+	if not self.state.antiAFK then
+		self.afkConn=Players.LocalPlayer.Idled:Connect(function() VU:CaptureController(); VU:ClickButton2(Vector2.zero) end)
+	else
+		if self.afkConn then self.afkConn:Disconnect(); self.afkConn=nil end
+	end
+	self:setState({antiAFK=not self.state.antiAFK})
+end
+
+local MINIGAMES = {
+	{ id="RuinRush",  title="RuinRush",  Component=RRPanel },
+	{ id="Teleports", title="Teleports", Component=TeleportsPanel },
+}
+
+function Hub:render()
+	local s=self.state
+	local sideChildren={ Layout=Roact.createElement("UIListLayout",{Padding=UDim.new(0,6)}) }
+	for _,mg in ipairs(MINIGAMES) do
+		sideChildren["btn_"..mg.id]=Roact.createElement("TextButton",{
+			Text=(s.active==mg.id and "▶ " or "")..mg.title, Font=Enum.Font.GothamBold, TextSize=16,
+			BackgroundColor3=(s.active==mg.id) and Color3.fromRGB(70,120,200) or Color3.fromRGB(55,55,55),
+			TextColor3=Color3.new(1,1,1), BorderSizePixel=0, Size=UDim2.new(1,0,0,36),
+			[Roact.Event.Activated]=function() self:setState({active=mg.id}) end
+		},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})})
+	end
+	local contentChildren={ Layout=Roact.createElement("UIListLayout",{Padding=UDim.new(0,0)}) }
+	for _,mg in ipairs(MINIGAMES) do
+		contentChildren["panel_"..mg.id]=Roact.createElement("Frame",{Visible=(s.active==mg.id),BackgroundTransparency=1,Size=UDim2.new(1,0,1,0)},{ Panel=Roact.createElement(mg.Component) })
+	end
+
+	return Roact.createElement("ScreenGui",{ResetOnSpawn=false},{
+		Toggle=Roact.createElement("TextButton",{Text=":D",Font=Enum.Font.GothamBold,TextSize=22,BackgroundColor3=Color3.fromRGB(50,50,90),TextColor3=Color3.new(1,1,1),Size=UDim2.new(0,36,0,36),Position=UDim2.new(0,10,0,10),ZIndex=5,[Roact.Event.Activated]=function() self:setState({showUI=not s.showUI}) end}),
+		Main=Roact.createElement("Frame",{
+			Visible=s.showUI, Size=UDim2.new(0,760,0,400), Position=s.pos,
+			BackgroundColor3=Color3.fromRGB(30,30,30), BorderSizePixel=0,
+			[Roact.Ref]=function(r) self.ref=r end,
+			[Roact.Event.InputBegan]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:startDrag(io) end end,
+			[Roact.Event.InputChanged]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseMovement then self:doDrag(io) end end,
+			[Roact.Event.InputEnded]=function(_,io) if io.UserInputType==Enum.UserInputType.MouseButton1 then self:stopDrag() end end,
+		},{
+			UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,10)}),
+			Header=Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,48)},{
+				Title=Roact.createElement("TextLabel",{Text="Minigames Hub",Font=Enum.Font.GothamBold,TextSize=20,BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),Size=UDim2.new(0.6,0,1,0),Position=UDim2.new(0,14,0,0),TextXAlignment=Enum.TextXAlignment.Left}),
+				Anti=Roact.createElement("TextButton",{Text=s.antiAFK and "🟢 Anti-AFK ON" or "⚪ Anti-AFK",Font=Enum.Font.GothamBold,TextSize=16,BackgroundColor3=s.antiAFK and Color3.fromRGB(60,120,60) or Color3.fromRGB(70,70,70),TextColor3=Color3.new(1,1,1),BorderSizePixel=0,Size=UDim2.new(0,160,0,32),Position=UDim2.new(1,-174,0,8),[Roact.Event.Activated]=function() self:toggleAntiAFK() end},{UIC=Roact.createElement("UICorner",{CornerRadius=UDim.new(0,6)})}),
+			}),
+			Sep=Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(55,55,55),BorderSizePixel=0,Size=UDim2.new(1,-20,0,1),Position=UDim2.new(0,10,0,48)}),
+			Body=Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,-20,1,-62),Position=UDim2.new(0,10,0,58)},{
+				Layout=Roact.createElement("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,10)}),
+				Side=Roact.createElement("Frame",{BackgroundColor3=Color3.fromRGB(35,35,35),BorderSizePixel=0,Size=UDim2.new(0,190,1,0)},sideChildren),
+				Content=Roact.createElement("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,-200,1,0)},contentChildren),
+			})
+		})
+	})
+end
+
+Roact.mount(Roact.createElement(Hub), LP:WaitForChild("PlayerGui"))
