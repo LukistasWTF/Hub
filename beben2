@@ -1,0 +1,294 @@
+--// CodesViewer.client.lua
+-- Muestra los códigos activos y los imprime en la consola.
+-- Abre/cierra la ventana con la tecla K. Botón "Refrescar" para volver a consultar.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local load = require(ReplicatedStorage:WaitForChild("Fsys")).load
+local RouterClient = load("RouterClient")
+
+-- ---------- UI ----------
+local function makeUI()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CodesViewer"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = player:WaitForChild("PlayerGui")
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.fromScale(0.5, 0.48)
+    panel.Size = UDim2.fromOffset(520, 380)
+    panel.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    panel.Visible = false
+    panel.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 14)
+    corner.Parent = panel
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Color = Color3.fromRGB(70, 70, 70)
+    stroke.Parent = panel
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 12)
+    pad.PaddingBottom = UDim.new(0, 12)
+    pad.PaddingLeft = UDim.new(0, 14)
+    pad.PaddingRight = UDim.new(0, 14)
+    pad.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Text = "Códigos disponibles"
+    title.TextColor3 = Color3.fromRGB(240, 240, 240)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 20
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -40, 0, 24)
+    title.Parent = panel
+
+    local close = Instance.new("TextButton")
+    close.Name = "Close"
+    close.Text = "✕"
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 18
+    close.TextColor3 = Color3.fromRGB(220, 220, 220)
+    close.BackgroundTransparency = 1
+    close.AnchorPoint = Vector2.new(1, 0)
+    close.Position = UDim2.new(1, -4, 0, 0)
+    close.Size = UDim2.fromOffset(28, 28)
+    close.Parent = panel
+
+    local refresh = Instance.new("TextButton")
+    refresh.Name = "Refresh"
+    refresh.Text = "Refrescar"
+    refresh.Font = Enum.Font.GothamMedium
+    refresh.TextSize = 16
+    refresh.TextColor3 = Color3.fromRGB(15, 15, 15)
+    refresh.BackgroundColor3 = Color3.fromRGB(230, 230, 230)
+    refresh.AutoButtonColor = true
+    refresh.Size = UDim2.fromOffset(100, 30)
+    refresh.Position = UDim2.new(0, 0, 0, 34)
+    refresh.Parent = panel
+
+    local refreshCorner = Instance.new("UICorner")
+    refreshCorner.CornerRadius = UDim.new(0, 8)
+    refreshCorner.Parent = refresh
+
+    local listFrame = Instance.new("ScrollingFrame")
+    listFrame.Name = "List"
+    listFrame.Position = UDim2.new(0, 0, 0, 74)
+    listFrame.Size = UDim2.new(1, 0, 1, -86)
+    listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    listFrame.ScrollBarThickness = 6
+    listFrame.BackgroundTransparency = 1
+    listFrame.Parent = panel
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = listFrame
+
+    local function updateCanvas()
+        listFrame.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y)
+    end
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvas)
+
+    return gui, panel, close, refresh, listFrame
+end
+
+local GUI, Panel, CloseBtn, RefreshBtn, ListFrame = makeUI()
+
+-- ---------- FETCH ----------
+local function tryRouter(path: string)
+    local okGet, remote = pcall(RouterClient.get, path)
+    if okGet and remote and remote.InvokeServer then
+        local okInvoke, data = pcall(remote.InvokeServer, remote)
+        if okInvoke then return true, data end
+        return false, data
+    end
+    return false, "not-found"
+end
+
+local function fetchCodes()
+    -- Devuelve: ok:boolean, data:any|error
+    local ok, data = tryRouter("CodeRedemptionAPI/ListCodes")
+    if not ok then
+        ok, data = tryRouter("CodeRedemptionAPI/GetCodes")
+    end
+    if not ok then
+        -- Fallback: busca un RemoteFunction genérico llamado "ListCodes"
+        local rf = ReplicatedStorage:FindFirstChild("ListCodes", true)
+        if rf and rf:IsA("RemoteFunction") then
+            local okInvoke, res = pcall(function() return rf:InvokeServer() end)
+            if okInvoke then ok, data = true, res end
+        end
+    end
+    return ok, data
+end
+
+local function normalize(raw)
+    -- Intenta convertir el resultado en una lista { {code=..., active=..., reward=..., expiresAt=..., usesLeft=...}, ... }
+    local out = {}
+    if typeof(raw) == "table" then
+        if #raw > 0 then
+            for _, v in ipairs(raw) do
+                if typeof(v) == "table" then
+                    table.insert(out, {
+                        code = v.code or v.Code or v[1],
+                        reward = v.reward or v.Reward or v[2],
+                        expiresAt = v.expiresAt or v.ExpiresAt or v[3],
+                        usesLeft = v.usesLeft or v.UsesLeft or v[4],
+                        active = (v.active ~= false) and (v.enabled ~= false) and true or false,
+                    })
+                elseif typeof(v) == "string" then
+                    table.insert(out, { code = v, active = true })
+                end
+            end
+        else
+            for k, v in pairs(raw) do
+                if typeof(v) == "table" then
+                    table.insert(out, {
+                        code = v.code or v.Code or k,
+                        reward = v.reward or v.Reward,
+                        expiresAt = v.expiresAt or v.ExpiresAt,
+                        usesLeft = v.usesLeft or v.UsesLeft,
+                        active = (v.active ~= false) and (v.enabled ~= false) and true or false,
+                    })
+                else
+                    table.insert(out, { code = tostring(k), active = v ~= false })
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if (a.active and not b.active) then return true end
+        if (b.active and not a.active) then return false end
+        return tostring(a.code) < tostring(b.code)
+    end)
+    return out
+end
+
+-- ---------- RENDER ----------
+local function clearList()
+    for _, child in ipairs(ListFrame:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+end
+
+local function addRow(idx, rec)
+    local row = Instance.new("Frame")
+    row.Name = "Row_" .. tostring(idx)
+    row.Size = UDim2.new(1, 0, 0, 36)
+    row.BackgroundColor3 = Color3.fromRGB(33, 33, 33)
+    row.Parent = ListFrame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = row
+
+    local codeLabel = Instance.new("TextLabel")
+    codeLabel.BackgroundTransparency = 1
+    codeLabel.Size = UDim2.new(0.55, 0, 1, 0)
+    codeLabel.Position = UDim2.new(0, 10, 0, 0)
+    codeLabel.Font = Enum.Font.GothamMedium
+    codeLabel.TextSize = 16
+    codeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    codeLabel.TextColor3 = Color3.fromRGB(235, 235, 235)
+    codeLabel.Text = tostring(rec.code or "¿?")
+    codeLabel.Parent = row
+
+    local info = Instance.new("TextLabel")
+    info.BackgroundTransparency = 1
+    info.Size = UDim2.new(0.45, -10, 1, 0)
+    info.Position = UDim2.new(0.55, 0, 0, 0)
+    info.Font = Enum.Font.Gotham
+    info.TextSize = 14
+    info.TextXAlignment = Enum.TextXAlignment.Right
+    info.TextColor3 = Color3.fromRGB(200, 200, 200)
+    local status = rec.active and "ACTIVO" or "INACTIVO"
+    local uses = (rec.usesLeft ~= nil) and (" • usos: " .. tostring(rec.usesLeft)) or ""
+    local reward = rec.reward and (" • " .. tostring(rec.reward)) or ""
+    info.Text = status .. uses .. reward
+    info.Parent = row
+end
+
+local function render(data)
+    clearList()
+    for i, rec in ipairs(data) do
+        addRow(i, rec)
+    end
+end
+
+-- ---------- TOGGLE / OPEN ----------
+local function open()
+    if Panel.Visible then return end
+    Panel.Visible = true
+    Panel.Position = UDim2.fromScale(0.5, 0.55)
+    Panel.BackgroundTransparency = 1
+    TweenService:Create(Panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = UDim2.fromScale(0.5, 0.48),
+        BackgroundTransparency = 0
+    }):Play()
+end
+
+local function close()
+    if not Panel.Visible then return end
+    local tween = TweenService:Create(Panel, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+        Position = UDim2.fromScale(0.5, 0.52),
+        BackgroundTransparency = 1
+    })
+    tween:Play()
+    tween.Completed:Wait()
+    Panel.Visible = false
+end
+
+local function toggle() if Panel.Visible then close() else open() end end
+
+-- ---------- WIRE ----------
+CloseBtn.MouseButton1Click:Connect(close)
+
+RefreshBtn.MouseButton1Click:Connect(function()
+    RefreshBtn.AutoButtonColor = false
+    RefreshBtn.Text = "Cargando..."
+    local ok, raw = fetchCodes()
+    if ok then
+        local list = normalize(raw)
+        -- imprime también en consola:
+        print("[CodesViewer] Códigos recibidos (" .. tostring(#list) .. "):")
+        for _, r in ipairs(list) do
+            print(("- %s%s%s"):format(
+                tostring(r.code or "?"),
+                r.active and " [ACTIVO]" or " [INACTIVO]",
+                r.reward and (" | " .. tostring(r.reward)) or ""
+            ))
+        end
+        render(list)
+    else
+        warn("[CodesViewer] No se pudieron obtener códigos. Detalle:", raw)
+        render({})
+    end
+    RefreshBtn.Text = "Refrescar"
+    RefreshBtn.AutoButtonColor = true
+end)
+
+-- Tecla K para abrir/cerrar
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.K then
+        toggle()
+        if Panel.Visible then
+            -- Autorefresco al abrir
+            task.defer(function() RefreshBtn:Activate() end)
+        end
+    end
+end)
